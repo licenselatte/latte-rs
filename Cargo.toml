@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Rust SDK for LicenseLatte license activation and offline verification"
 license = "MIT"
+repository = "https://github.com/licenselatte/latte-rs"
+readme = "README.md"
+keywords = ["license", "licensing", "activation", "ed25519", "sdk"]
+categories = ["authentication", "api-bindings"]
 
 [dependencies]
 ed25519-dalek = "2"

@@ -50,7 +50,7 @@ struct CachedActivation {
 /// "caching unavailable" rather than an error.
 pub fn default_path(project_key: &str) -> Option<PathBuf> {
     let mut path = dirs::config_dir()?;
-    path.push("licenselatte");
+    path.push("LicenseLatte");
     path.push(format!("{project_key}.json"));
     Some(path)
 }

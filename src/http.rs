@@ -42,23 +42,23 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// every other field with its default:
 ///
 /// ```no_run
-/// use latte::http::{Config, Sdk};
+/// use latte_rs::http::{Config, Sdk};
 ///
 /// let sdk = Sdk::new(Config::with_app_id("pk_live_..."))?;
-/// # Ok::<(), latte::error::LatteError>(())
+/// # Ok::<(), latte_rs::error::LatteError>(())
 /// ```
 ///
 /// To override further fields, chain the other `with_*` builder methods
 /// onto it:
 ///
 /// ```no_run
-/// use latte::http::{Config, Sdk};
+/// use latte_rs::http::{Config, Sdk};
 ///
 /// let sdk = Sdk::new(
 ///     Config::with_app_id("pk_live_...")
 ///         .with_base_url("https://relay.example.com"),
 /// )?;
-/// # Ok::<(), latte::error::LatteError>(())
+/// # Ok::<(), latte_rs::error::LatteError>(())
 /// ```
 ///
 /// This type is `#[non_exhaustive]`: it gains fields over time, so it can't

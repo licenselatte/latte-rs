@@ -24,9 +24,9 @@
 //! `src/storage.rs`'s own unit tests separately cover the cache file
 //! format/atomicity in isolation, with no key material involved at all.
 
-use latte::error::LatteError;
-use latte::http::{Config, Sdk};
-use latte::storage;
+use latte_rs::error::LatteError;
+use latte_rs::http::{Config, Sdk};
+use latte_rs::storage;
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -265,8 +265,8 @@ async fn license_key_short_id_must_match_this_projects_app_key() {
 
 // --- cache ---
 
-fn garbage_chain() -> latte::domain::CertChain {
-    latte::domain::CertChain {
+fn garbage_chain() -> latte_rs::domain::CertChain {
+    latte_rs::domain::CertChain {
         submaster: "s".to_string(),
         project: "p".to_string(),
         daily: "d".to_string(),

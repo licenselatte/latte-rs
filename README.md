@@ -63,7 +63,7 @@ not documented in any SDK repo.
 
 ```toml
 [dependencies]
-latte = { path = "../latte-rs" }  # or a registry version, once published
+latte-rs = { path = "../latte-rs" }  # or a registry version, once published
 ```
 
 Two features are on by default and independently toggleable:
@@ -77,7 +77,7 @@ dependency:
 
 ```toml
 [dependencies]
-latte = { path = "../latte-rs", default-features = false }
+latte-rs = { path = "../latte-rs", default-features = false }
 ```
 
 `default-features = false, features = ["http"]` gets you network activation
@@ -87,7 +87,7 @@ environment where writing a cache file isn't possible.
 ## Quick start: activating a license
 
 ```rust
-use latte::{Config, Sdk};
+use latte_rs::{Config, Sdk};
 
 #[tokio::main]
 async fn main() {
@@ -119,9 +119,9 @@ whatever schedule fits your application.
 ## Checking a cached activation without a network call
 
 ```rust
-use latte::error::LatteError;
+use latte_rs::error::LatteError;
 
-fn on_startup(sdk: &latte::Sdk, machine_id: &str) {
+fn on_startup(sdk: &latte_rs::Sdk, machine_id: &str) {
     match sdk.check(machine_id) {
         Ok(lic) => println!("license OK, expires {:?}", lic.expires_at),
         Err(LatteError::LicenseExpired) => eprintln!("license expired, please renew"),
@@ -138,8 +138,8 @@ feature, `check_license_at` runs the same verify+validate pipeline
 `Sdk::activate`/`Sdk::check` do, against a token/chain you already have:
 
 ```rust
-use latte::{check_license_at, CheckError};
-use latte::domain::CertChain;
+use latte_rs::{check_license_at, CheckError};
+use latte_rs::domain::CertChain;
 use ed25519_dalek::VerifyingKey;
 use std::time::SystemTime;
 
@@ -195,7 +195,7 @@ outright rejection.
 
 ## License-key format utilities
 
-`latte::key` and `latte::appid` implement the same license-key/AppID
+`latte_rs::key` and `latte_rs::appid` implement the same license-key/AppID
 normalization and checksum validation as every other LicenseLatte SDK
 (uppercase, strip separators, fold `O/I/L` to `0/1/1`, verify a 2- or
 4-character trailing checksum). This is a typo-catcher for end users pasting

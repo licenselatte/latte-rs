@@ -4,10 +4,10 @@
 //! against.
 
 use ed25519_dalek::VerifyingKey;
-use latte::domain::CertChain;
-use latte::error::ValidateError;
-use latte::validate::{in_grace_period, validate_at};
-use latte::verify::verify_activation_at;
+use latte_rs::domain::CertChain;
+use latte_rs::error::ValidateError;
+use latte_rs::validate::{in_grace_period, validate_at};
+use latte_rs::verify::verify_activation_at;
 use serde::Deserialize;
 use std::fs;
 use std::time::{Duration, SystemTime};

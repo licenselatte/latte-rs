@@ -63,7 +63,7 @@ not documented in any SDK repo.
 
 ```toml
 [dependencies]
-latte-rs = { path = "../latte-rs" }  # or a registry version, once published
+latte-rs = "0"
 ```
 
 Two features are on by default and independently toggleable:
@@ -77,7 +77,7 @@ dependency:
 
 ```toml
 [dependencies]
-latte-rs = { path = "../latte-rs", default-features = false }
+latte-rs = { version = "0", default-features = false }
 ```
 
 `default-features = false, features = ["http"]` gets you network activation

@@ -1,6 +1,6 @@
 [package]
 name = "latte-rs"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Rust SDK for LicenseLatte license activation and offline verification"
 license = "MIT"

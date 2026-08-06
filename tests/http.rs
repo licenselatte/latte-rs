@@ -50,13 +50,10 @@ fn temp_cache_path() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 async fn sdk_against(mock_server: &MockServer, cache_path: std::path::PathBuf) -> Sdk {
-    Sdk::new(Config {
-        app_id: TEST_APP_ID.to_string(),
-        timeout: None,
-        base_url: Some(mock_server.uri()),
-        cache_path: Some(cache_path),
-    })
-    .expect("valid test AppID")
+    let config = Config::with_app_id(TEST_APP_ID)
+        .with_base_url(mock_server.uri())
+        .with_cache_path(cache_path);
+    Sdk::new(config).expect("valid test AppID")
 }
 
 #[tokio::test]
@@ -220,13 +217,11 @@ async fn transport_failure_is_a_network_error() {
     // Nothing is listening on this port (a closed/unbound loopback port),
     // so the connection itself fails before any HTTP response exists.
     let (_dir, cache_path) = temp_cache_path();
-    let sdk = Sdk::new(Config {
-        app_id: TEST_APP_ID.to_string(),
-        timeout: Some(std::time::Duration::from_millis(500)),
-        base_url: Some("http://127.0.0.1:1".to_string()),
-        cache_path: Some(cache_path),
-    })
-    .unwrap();
+    let config = Config::with_app_id(TEST_APP_ID)
+        .with_timeout(std::time::Duration::from_millis(500))
+        .with_base_url("http://127.0.0.1:1")
+        .with_cache_path(cache_path);
+    let sdk = Sdk::new(config).unwrap();
 
     let err = sdk
         .activate(TEST_LICENSE_KEY, TEST_MACHINE_ID)
@@ -281,13 +276,8 @@ fn garbage_chain() -> latte::domain::CertChain {
 #[tokio::test]
 async fn check_reports_not_activated_when_nothing_is_cached() {
     let (_dir, cache_path) = temp_cache_path();
-    let sdk = Sdk::new(Config {
-        app_id: TEST_APP_ID.to_string(),
-        timeout: None,
-        base_url: None,
-        cache_path: Some(cache_path),
-    })
-    .unwrap();
+    let config = Config::with_app_id(TEST_APP_ID).with_cache_path(cache_path);
+    let sdk = Sdk::new(config).unwrap();
 
     let err = sdk.check(TEST_MACHINE_ID).unwrap_err();
     assert!(matches!(err, LatteError::NotActivated), "got {err:?}");
@@ -298,13 +288,8 @@ async fn check_reports_not_activated_for_a_cache_that_fails_verification() {
     let (_dir, cache_path) = temp_cache_path();
     storage::save(&cache_path, "not-a-real-jwt", &garbage_chain()).unwrap();
 
-    let sdk = Sdk::new(Config {
-        app_id: TEST_APP_ID.to_string(),
-        timeout: None,
-        base_url: None,
-        cache_path: Some(cache_path),
-    })
-    .unwrap();
+    let config = Config::with_app_id(TEST_APP_ID).with_cache_path(cache_path);
+    let sdk = Sdk::new(config).unwrap();
 
     let err = sdk.check(TEST_MACHINE_ID).unwrap_err();
     assert!(matches!(err, LatteError::NotActivated), "got {err:?}");

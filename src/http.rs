@@ -37,6 +37,36 @@ const MASTER_PUBLIC_KEY_HEX: &str =
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for [`Sdk::new`].
+///
+/// The recommended way to build one is [`Config::with_app_id`], which fills
+/// every other field with its default:
+///
+/// ```no_run
+/// use latte::http::{Config, Sdk};
+///
+/// let sdk = Sdk::new(Config::with_app_id("pk_live_..."))?;
+/// # Ok::<(), latte::error::LatteError>(())
+/// ```
+///
+/// To override further fields, chain the other `with_*` builder methods
+/// onto it:
+///
+/// ```no_run
+/// use latte::http::{Config, Sdk};
+///
+/// let sdk = Sdk::new(
+///     Config::with_app_id("pk_live_...")
+///         .with_base_url("https://relay.example.com"),
+/// )?;
+/// # Ok::<(), latte::error::LatteError>(())
+/// ```
+///
+/// This type is `#[non_exhaustive]`: it gains fields over time, so it can't
+/// be constructed with a struct literal (not even with `..Default::default()`)
+/// outside this crate — build it with `with_app_id`/`Default::default()` and
+/// the other `with_*` methods instead.
+#[non_exhaustive]
+#[derive(Default)]
 pub struct Config {
     /// `pk_{env}_{32-char key}`, shown in the LicenseLatte dashboard.
     pub app_id: String,
@@ -52,6 +82,43 @@ pub struct Config {
     /// choosing instead (or to point tests at a temp directory).
     #[cfg(feature = "cache")]
     pub cache_path: Option<std::path::PathBuf>,
+}
+
+impl Config {
+    /// Builds a `Config` with `app_id` set and every other field at its
+    /// default (30s timeout, environment-default base URL, default cache
+    /// location). This is the recommended way to construct a `Config`;
+    /// see the type-level docs for how to override individual fields on
+    /// top of it.
+    pub fn with_app_id(app_id: impl Into<String>) -> Self {
+        Self {
+            app_id: app_id.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Overrides the request timeout for `activate`/`renew`. Defaults to
+    /// 30s if never called.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Overrides the API base URL that `app_id`'s environment would
+    /// otherwise select. Useful for routing through a corporate
+    /// proxy/self-hosted relay, or for pointing tests at a mock server.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Overrides where the on-disk token cache lives. Defaults to a
+    /// per-project location if never called.
+    #[cfg(feature = "cache")]
+    pub fn with_cache_path(mut self, cache_path: impl Into<std::path::PathBuf>) -> Self {
+        self.cache_path = Some(cache_path.into());
+        self
+    }
 }
 
 /// Activates and renews licenses over the network, with an optional local

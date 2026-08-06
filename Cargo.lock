@@ -708,7 +708,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "latte"
+name = "latte-rs"
 version = "0.1.0"
 dependencies = [
  "base64",

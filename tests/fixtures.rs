@@ -78,7 +78,7 @@ fn reason_for(err: &ValidateError) -> &'static str {
 
 #[test]
 fn fixtures() {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata");
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vectors");
     let mut ran = 0;
     let mut failures = Vec::new();
 

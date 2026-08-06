@@ -5,6 +5,8 @@ licensing platform. This is an idiomatic, memory-safe, no-`unsafe`,
 no-FFI Rust implementation of license activation and verification, not a
 binding on top of the C SDK.
 
+Full docs: [licenselatte.com/docs/sdks/rust](https://licenselatte.com/docs/sdks/rust)
+
 > [!NOTE]
 > The Rust SDK versions independently from the other language bindings and follows semver. It's currently on v0.x, meaning the public API may still change without a major version bump. It moves to 1.0.0 once the API is validated across real integrations.
 

@@ -231,7 +231,7 @@ async fn transport_failure_is_a_network_error() {
 }
 
 #[tokio::test]
-async fn bad_license_key_format_never_reaches_the_network() {
+async fn empty_license_key_never_reaches_the_network() {
     // No mock is mounted at all: if activate() incorrectly made a network
     // call here, wiremock's default "no matching stub" 404 response would
     // surface as LicenseNotFound instead of InvalidKey, so this test would
@@ -240,27 +240,40 @@ async fn bad_license_key_format_never_reaches_the_network() {
     let (_dir, cache_path) = temp_cache_path();
     let sdk = sdk_against(&mock_server, cache_path).await;
 
-    let err = sdk
-        .activate("too-short", TEST_MACHINE_ID)
-        .await
-        .unwrap_err();
+    let err = sdk.activate("", TEST_MACHINE_ID).await.unwrap_err();
     assert!(matches!(err, LatteError::InvalidKey), "got {err:?}");
 }
 
 #[tokio::test]
-async fn license_key_short_id_must_match_this_projects_app_key() {
+async fn non_native_format_key_reaches_the_network_instead_of_being_rejected_locally() {
+    // Doesn't match this project's short_id and fails the checksum -- the
+    // strict format gate used to reject this before ever calling the
+    // network. Now the server is the sole arbiter of native vs.
+    // legacy-alias vs. not-found, so it must reach the network unchanged
+    // (normalized only: uppercased, separators stripped).
     let mock_server = MockServer::start().await;
     let (_dir, cache_path) = temp_cache_path();
-    let sdk = sdk_against(&mock_server, cache_path).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/activate"))
+        .and(body_json(json!({
+            "project_key": TEST_APP_ID,
+            "license_key": "ACMELEGACY2019KEY",
+            "machine_id": TEST_MACHINE_ID,
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "token": "not-a-real-jwt",
+            "activation_id": "11111111-1111-1111-1111-111111111111",
+            "chain": {"submaster": "s", "project": "p", "daily": "d"},
+        })))
+        .mount(&mock_server)
+        .await;
 
-    // Right length and checksum, but a short_id belonging to a different
-    // project.
-    let wrong_project_key = "ZZZZZZBCDEFGHJKMNPQRSTVWXYZ00Z";
+    let sdk = sdk_against(&mock_server, cache_path).await;
     let err = sdk
-        .activate(wrong_project_key, TEST_MACHINE_ID)
+        .activate("acme-legacy-2019-key", TEST_MACHINE_ID)
         .await
         .unwrap_err();
-    assert!(matches!(err, LatteError::InvalidKey), "got {err:?}");
+    assert!(matches!(err, LatteError::Server(_)), "got {err:?}");
 }
 
 // --- cache ---

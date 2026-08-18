@@ -102,6 +102,7 @@ mod tests {
     fn base_license(now: SystemTime) -> License {
         License {
             key: "K".into(),
+            alias: String::new(),
             activation_id: "A".into(),
             project_id: "P".into(),
             machine_id: "M".into(),

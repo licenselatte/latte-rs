@@ -24,7 +24,11 @@ use serde::{Deserialize, Serialize};
 use crate::appid::parse_app_id;
 use crate::domain::CertChain;
 use crate::error::LatteError;
-use crate::key::{sanitize_key, validate_key};
+use crate::key::{normalize_key, sanitize_key};
+#[cfg(feature = "cache")]
+use crate::validate::{in_grace_period, validate_at};
+#[cfg(feature = "cache")]
+use crate::verify::verify_activation_at;
 use crate::{check_license_at, PublicLicense};
 #[cfg(feature = "cache")]
 use crate::{error::ValidateError, storage, CheckError};
@@ -127,7 +131,6 @@ impl Config {
 pub struct Sdk {
     base_url: String,
     app_id: String,
-    app_key: String,
     http: reqwest::Client,
     master_pub: VerifyingKey,
     #[cfg(feature = "cache")]
@@ -167,7 +170,6 @@ impl Sdk {
                 .base_url
                 .unwrap_or_else(|| parsed.env.base_url().to_string()),
             app_id: config.app_id,
-            app_key: parsed.key,
             http,
             master_pub,
             #[cfg(feature = "cache")]
@@ -177,37 +179,46 @@ impl Sdk {
 
     /// Activates `license_key` for `machine_id`.
     ///
-    /// The key is sanitized then format/checksum-validated against this
-    /// SDK's own project key first; a mismatch is `LatteError::InvalidKey`
-    /// and never reaches the network or the cache.
+    /// The key is normalized and given a minimal sanity check (non-empty,
+    /// not implausibly long) before ever reaching the network — a license
+    /// key may be native or a legacy-system alias (see the
+    /// legacy-key-migration feature in license-latte-api,
+    /// internal/usecase/api/activate_license.go), and only the server
+    /// knows which, so anything beyond that minimal check is deferred to
+    /// it.
     ///
-    /// With the `cache` feature, a cached activation for this exact
-    /// (sanitized) key is tried first; if it's still valid, it's returned
-    /// without a network call. Any other outcome (no cache, a cache for a
-    /// different key, or a cached token that fails verification/validation)
-    /// falls through to a network call, and a successful result is
-    /// written back to the cache. A server response that fails local
-    /// verification/validation surfaces as `LatteError::Server`, not one of
-    /// the sentinel variants (those are reserved for the server's HTTP
-    /// status code itself).
+    /// With the `cache` feature, a cached activation for this exact key is
+    /// tried first; if it's still valid, it's returned without a network
+    /// call. A cache hit matches either the cached license's native key
+    /// (`sub` claim) against the sanitized input, or — for a license
+    /// resolved via a legacy-key alias, where `sub` is the newly minted
+    /// native key rather than the string the caller keeps passing — its
+    /// `alias` claim against the normalized input. Any other outcome (no
+    /// cache, a cache for a different key, or a cached token that fails
+    /// verification/validation) falls through to a network call, and a
+    /// successful result is written back to the cache. A server response
+    /// that fails local verification/validation surfaces as
+    /// `LatteError::Server`, not one of the sentinel variants (those are
+    /// reserved for the server's HTTP status code itself).
     pub async fn activate(
         &self,
         license_key: &str,
         machine_id: &str,
     ) -> Result<PublicLicense, LatteError> {
         let sanitized = sanitize_key(license_key);
-        self.validate_license_key(&sanitized)?;
+        let normalized = normalize_key(license_key);
+        self.validate_license_key(&normalized)?;
 
         #[cfg(feature = "cache")]
-        if let Some(lic) = self.cached_license(machine_id) {
-            if lic.key == sanitized {
+        if let Some((lic, alias)) = self.cached_license(machine_id) {
+            if lic.key == sanitized || (!alias.is_empty() && alias == normalized) {
                 return Ok(lic);
             }
         }
 
         let body = ActivateRequest {
             project_key: &self.app_id,
-            license_key: &sanitized,
+            license_key: &normalized,
             machine_id,
         };
         let (token, chain) = self
@@ -284,34 +295,42 @@ impl Sdk {
         }
     }
 
-    /// 30 chars after sanitizing (6-char short_id + 22 random + 2
-    /// checksum); the short_id must equal the first 6 chars of this
-    /// project's AppID key segment, and the trailing 2 chars must be a
-    /// valid checksum over the 22 before them.
-    fn validate_license_key(&self, sanitized: &str) -> Result<(), LatteError> {
-        if sanitized.len() != 30 {
-            return Err(LatteError::InvalidKey);
-        }
-        if sanitized.as_bytes()[..6] != self.app_key.as_bytes()[..6] {
-            return Err(LatteError::InvalidKey);
-        }
-        if !validate_key(&sanitized[6..], 2) {
+    /// A minimal local sanity check, not a format check: a license key
+    /// may be native or a legacy-system alias (see the legacy-key-migration
+    /// feature in license-latte-api, internal/usecase/api/activate_license.go),
+    /// and only the server knows which. This exists only to reject
+    /// obviously-not-a-key input (empty, or implausibly long) without a
+    /// network round trip.
+    fn validate_license_key(&self, normalized: &str) -> Result<(), LatteError> {
+        if normalized.is_empty() || normalized.len() > 256 {
             return Err(LatteError::InvalidKey);
         }
         Ok(())
     }
 
+    /// Verifies+validates the cached token, if any, returning both its
+    /// public-facing shape and its (internal-only) alias claim so the
+    /// fast path in `activate` can match a legacy-key alias too.
     #[cfg(feature = "cache")]
-    fn cached_license(&self, machine_id: &str) -> Option<PublicLicense> {
+    fn cached_license(&self, machine_id: &str) -> Option<(PublicLicense, String)> {
         let (token, chain) = storage::load(self.cache_path.as_deref()?)?;
-        check_license_at(
-            &self.master_pub,
-            &token,
-            &chain,
-            machine_id,
-            SystemTime::now(),
-        )
-        .ok()
+        let now = SystemTime::now();
+        let license = verify_activation_at(&self.master_pub, &token, &chain, now).ok()?;
+        validate_at(&license, machine_id, now).ok()?;
+        let in_grace = in_grace_period(&license, now);
+        let alias = license.alias.clone();
+        let public = PublicLicense {
+            key: license.key,
+            activation_id: license.activation_id,
+            project_id: license.project_id,
+            issued_at: license.issued_at,
+            expires_at: license.expires_at,
+            grace_period: license.grace_period,
+            in_grace_period: in_grace,
+            license_type: license.license_type,
+            metadata: license.metadata,
+        };
+        Some((public, alias))
     }
 
     #[cfg(feature = "cache")]

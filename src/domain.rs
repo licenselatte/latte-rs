@@ -32,6 +32,14 @@ impl LicenseType {
 #[derive(Debug, Clone)]
 pub struct License {
     pub key: String,
+    /// The legacy-system key string this license was resolved from, when
+    /// it was minted via a legacy-key migration alias rather than
+    /// activated by its own native key. Empty for a natively-keyed
+    /// license. Internal only — used to recognize a cached token on a
+    /// later `activate` call passing the same legacy key, since `key`
+    /// above will be the newly minted native key instead. See the JWT's
+    /// "alias" claim.
+    pub alias: String,
     pub activation_id: String,
     pub project_id: String,
     pub machine_id: String,

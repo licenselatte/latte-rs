@@ -67,6 +67,7 @@ pub fn verify_activation_at(
     let claims = &activation.claims;
 
     let key = claim_str(claims, "sub").unwrap_or("").to_string();
+    let alias = claim_str(claims, "alias").unwrap_or("").to_string();
     let activation_id = claim_str(claims, "aid").unwrap_or("").to_string();
     let project_id = claim_str(claims, "pid").unwrap_or("").to_string();
     let machine_id = claim_str(claims, "mid").unwrap_or("").to_string();
@@ -137,6 +138,7 @@ pub fn verify_activation_at(
 
     Ok(License {
         key,
+        alias,
         activation_id,
         project_id,
         machine_id,
@@ -229,6 +231,21 @@ mod tests {
             .expect("valid chain should verify");
         assert_eq!(lic.key, "KEY");
         assert_eq!(lic.project_id, "proj_1");
+        assert_eq!(lic.alias, "");
+    }
+
+    #[test]
+    fn alias_claim_is_parsed_when_present() {
+        let now = 10_000_000;
+        let tc = build_chain(now);
+        let mut claims = activation_claims(now);
+        claims["alias"] = json!("ACMELEGACY2019KEY");
+        let token = sign_jwt(&tc.daily, claims);
+        let now_t = SystemTime::UNIX_EPOCH + Duration::from_secs(now as u64);
+        let lic = verify_activation_at(&tc.master.verifying_key(), &token, &tc.chain, now_t)
+            .expect("valid chain should verify");
+        assert_eq!(lic.key, "KEY");
+        assert_eq!(lic.alias, "ACMELEGACY2019KEY");
     }
 
     #[test]

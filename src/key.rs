@@ -46,7 +46,10 @@ pub fn validate_key(key: &str, checksum_len: usize) -> bool {
 /// characters `O -> 0`, `I -> 1`, `L -> 1` (in that order; `I` and `L`
 /// both fold to `1`, so a sanitized key can never distinguish an original
 /// `L` from an original `I` from an original `1`; this is intentional,
-/// not an oversight).
+/// not an oversight). This fold is specific to the native key alphabet
+/// (which deliberately excludes `O`/`I`/`L`) — use it only where the
+/// value is expected to be a native-format key. Use `normalize_key` for
+/// anything else.
 pub fn sanitize_key(input: &str) -> String {
     let mut s = input.to_uppercase();
     s.retain(|c| c != '-' && c != ' ');
@@ -60,6 +63,16 @@ pub fn sanitize_key(input: &str) -> String {
         .collect()
 }
 
+/// Uppercases and strips hyphens/spaces, with no other transformation.
+/// Unlike `sanitize_key`, this never assumes the input is in the native
+/// key alphabet, so it's safe to use on any license key string regardless
+/// of which system minted it.
+pub fn normalize_key(input: &str) -> String {
+    let mut s = input.to_uppercase();
+    s.retain(|c| c != '-' && c != ' ');
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +80,11 @@ mod tests {
     #[test]
     fn sanitize_folds_ambiguous_chars() {
         assert_eq!(sanitize_key("ab-cd IL o"), "ABCD110");
+    }
+
+    #[test]
+    fn normalize_strips_separators_without_folding_ambiguous_chars() {
+        assert_eq!(normalize_key("ab-cd IL o"), "ABCDILO");
     }
 
     #[test]

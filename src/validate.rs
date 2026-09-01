@@ -111,6 +111,7 @@ mod tests {
             grace_period: Duration::from_secs(7 * 24 * 60 * 60),
             license_type: LicenseType::Expiring,
             metadata: HashMap::new(),
+            entitlements: None,
         }
     }
 

@@ -319,18 +319,7 @@ impl Sdk {
         validate_at(&license, machine_id, now).ok()?;
         let in_grace = in_grace_period(&license, now);
         let alias = license.alias.clone();
-        let public = PublicLicense {
-            key: license.key,
-            activation_id: license.activation_id,
-            project_id: license.project_id,
-            issued_at: license.issued_at,
-            expires_at: license.expires_at,
-            grace_period: license.grace_period,
-            in_grace_period: in_grace,
-            license_type: license.license_type,
-            metadata: license.metadata,
-        };
-        Some((public, alias))
+        Some((crate::to_public_license(license, in_grace), alias))
     }
 
     #[cfg(feature = "cache")]

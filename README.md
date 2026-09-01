@@ -223,6 +223,84 @@ Writes go to a temp file in the same directory and get renamed into place,
 so a crash or a concurrent write can't leave a half-written file behind.
 `Config::cache_path` overrides the location if you want it somewhere else.
 
+## Entitlements
+
+Entitlements are the typed answers a seller signed into a licence about what
+their customer bought. Two questions, and only two: *may this customer do X*
+(a boolean) and *how many Y do they get* (an integer).
+
+```rust
+let lic = sdk.activate(&key, &machine_id)?;
+
+if lic.can("export_pdf") {
+    enable_pdf_export();
+}
+
+if let Some(max) = lic.limit("max_projects") {
+    if max != latte_rs::UNLIMITED && used >= max {
+        return Err(Error::ProjectLimitReached);
+    }
+}
+```
+
+You set the values on a policy and override them per licence in the
+dashboard; the server resolves the two and signs the result into the
+activation token, so `can` and `limit` answer offline with no network call.
+
+`UNLIMITED` is `-1`. `limit` returns it as-is — compare against the exported
+constant rather than testing for a negative number.
+
+### The rules
+
+| | |
+|---|---|
+| **Absence denies.** | An unset key is ``can() == false``, ``limit() == None``. |
+| **No coercion.** | `can` on an integer is false even when it is non-zero. `limit` on a boolean misses rather than returning 1 or 0. |
+| **Keys are byte-exact.** | No case folding, no trimming. |
+| **A bad value is dropped, never fatal.** | If a value reaches the token that is neither a boolean nor an integer, that one entry vanishes and the licence stays valid. |
+
+### Rolling this out without switching your own features off
+
+Absence denies, and that has a consequence worth reading twice: **a token
+issued before you set any entitlements answers `false` to everything.** Ship
+`if !lic.can("export_pdf") { hide(); }` and every customer still holding a
+cached token from before the change loses PDF export until they renew.
+
+`has_entitlements()` exists for exactly this, and it is not a convenience
+accessor:
+
+```rust
+let enabled = if lic.has_entitlements() {
+    lic.can("export_pdf")
+} else {
+    legacy_behaviour() // this token predates entitlements
+};
+```
+
+The published order is: set the values in the dashboard first, wait one
+grace window for the installed base to renew, then ship the release that
+reads them behind `has_entitlements()`, and drop the fallback once the base
+has turned over.
+
+`has_entitlements()` reports whether the claim was **present**, including
+when it is empty — which is why it is not a length check on
+`lic.entitlements`.
+
+### Entitlements are not metadata
+
+Entitlements and `metadata` are separate namespaces and never merge.
+Metadata is arbitrary display data, filtered per field in the dashboard, and
+untyped; entitlements are booleans and integers, unfiltered, and exist
+precisely to be read on the customer's machine. The same key may appear in
+both meaning different things.
+
+Entitlements are a distribution mechanism for a signed answer, not a
+tamper-proofing one — see the threat-model section above. Entitlements
+change nothing about it. If real revenue depends on a feature, re-validate
+it server-side.
+
+---
+
 ## What this crate does *not* do
 
 OS-level machine-ID fingerprinting and background renewal scheduling are

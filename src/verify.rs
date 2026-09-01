@@ -4,6 +4,7 @@
 //! below); read it before "fixing" it.
 
 use crate::domain::{CertChain, License, LicenseType};
+use crate::entitlements::decode_entitlements;
 use crate::error::VerifyError;
 use crate::jwt::{claim_i64, claim_str, parse_and_verify, parse_and_verify_with_infinite_leeway};
 use ed25519_dalek::VerifyingKey;
@@ -82,6 +83,8 @@ pub fn verify_activation_at(
         .map(unix_to_system_time)
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
+    let entitlements = decode_entitlements(claims);
+
     let mut metadata = HashMap::new();
     if let Some(pmd) = claims.get("pmd").and_then(|v| v.as_object()) {
         for (k, v) in pmd {
@@ -147,6 +150,7 @@ pub fn verify_activation_at(
         grace_period,
         license_type,
         metadata,
+        entitlements,
     })
 }
 

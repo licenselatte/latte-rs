@@ -17,6 +17,7 @@
 
 pub mod appid;
 pub mod domain;
+pub mod entitlements;
 pub mod error;
 #[cfg(feature = "http")]
 pub mod http;
@@ -27,11 +28,13 @@ pub mod storage;
 pub mod validate;
 pub mod verify;
 
+pub use entitlements::{EntitlementValue, UNLIMITED};
 #[cfg(feature = "http")]
 pub use http::{Config, Sdk};
 
 use domain::{CertChain, License};
 use error::{ValidateError, VerifyError};
+use std::collections::HashMap;
 use std::fmt;
 use std::time::SystemTime;
 
@@ -56,7 +59,12 @@ impl fmt::Display for CheckError {
 impl std::error::Error for CheckError {}
 
 /// The verified, validated, "safe to use" view of a license.
+///
+/// `#[non_exhaustive]` so that a future claim can be surfaced here without
+/// a breaking release: construct one only through [`check_license_at`],
+/// which is how you get one anyway.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PublicLicense {
     pub key: String,
     pub activation_id: String,
@@ -66,7 +74,61 @@ pub struct PublicLicense {
     pub grace_period: std::time::Duration,
     pub in_grace_period: bool,
     pub license_type: domain::LicenseType,
-    pub metadata: std::collections::HashMap<String, String>,
+    pub metadata: HashMap<String, String>,
+
+    /// The typed feature map the seller signed into this licence, or
+    /// `None` when the token carried no `ent` claim at all.
+    ///
+    /// `None` and `Some(empty)` deny identically; they differ only in
+    /// [`PublicLicense::has_entitlements`], which is the probe an
+    /// application branches on while its installed base renews. Read
+    /// individual keys with [`PublicLicense::can`] and
+    /// [`PublicLicense::limit`] rather than indexing this directly, unless
+    /// you want to enumerate what was granted. See the [`entitlements`]
+    /// module for the full contract.
+    pub entitlements: Option<HashMap<String, EntitlementValue>>,
+}
+
+impl PublicLicense {
+    /// Whether the boolean entitlement named by `key` is present and true.
+    ///
+    /// A key that is absent, or that holds an integer rather than a
+    /// boolean, answers `false`. There is no coercion across kinds: `can`
+    /// on an integer entitlement is false even when that integer is
+    /// non-zero, because a rule that read "nonzero is true" is one five
+    /// SDKs would eventually disagree about.
+    pub fn can(&self, key: &str) -> bool {
+        self.entitlements
+            .as_ref()
+            .and_then(|e| e.get(key))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// The integer entitlement named by `key`, or `None` when it is absent.
+    ///
+    /// The unlimited sentinel is returned as-is: compare the result against
+    /// [`UNLIMITED`] rather than testing for a negative number. A key that
+    /// holds a boolean rather than an integer misses — `limit` on a boolean
+    /// is `None`, not 1 or 0.
+    pub fn limit(&self, key: &str) -> Option<i64> {
+        self.entitlements
+            .as_ref()
+            .and_then(|e| e.get(key))
+            .and_then(|v| v.as_int())
+    }
+
+    /// Whether the activation token carried an `ent` claim at all —
+    /// including an empty one, which is why this is not a length check.
+    ///
+    /// It exists for one job: letting an application fall back to its
+    /// pre-entitlements behaviour for the one release it takes an
+    /// installed base to renew. Absence denies, so without this probe,
+    /// shipping `can()` before setting values in the dashboard switches the
+    /// feature off for every customer holding an older cached token.
+    pub fn has_entitlements(&self) -> bool {
+        self.entitlements.is_some()
+    }
 }
 
 /// Runs the full pipeline on a cached or freshly-received token: chain
@@ -87,7 +149,18 @@ pub fn check_license_at(
 
     let in_grace = validate::in_grace_period(&license, now);
 
-    Ok(PublicLicense {
+    Ok(to_public_license(license, in_grace))
+}
+
+/// Projects a chain-verified [`License`] onto its public shape.
+///
+/// Shared with the cached-token path in `http.rs` rather than inlined at
+/// each call site: the two used to be duplicate struct literals, and a
+/// field added to one and not the other is a difference nothing would
+/// catch. `#[non_exhaustive]` now makes this the only way to build one
+/// from outside the crate anyway.
+pub(crate) fn to_public_license(license: License, in_grace: bool) -> PublicLicense {
+    PublicLicense {
         key: license.key,
         activation_id: license.activation_id,
         project_id: license.project_id,
@@ -97,5 +170,6 @@ pub fn check_license_at(
         in_grace_period: in_grace,
         license_type: license.license_type,
         metadata: license.metadata,
-    })
+        entitlements: license.entitlements,
+    }
 }

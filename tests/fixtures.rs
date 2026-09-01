@@ -8,6 +8,7 @@ use latte_rs::domain::CertChain;
 use latte_rs::error::ValidateError;
 use latte_rs::validate::{in_grace_period, validate_at};
 use latte_rs::verify::verify_activation_at;
+use latte_rs::{check_license_at, PublicLicense, UNLIMITED};
 use serde::Deserialize;
 use std::fs;
 use std::time::{Duration, SystemTime};
@@ -31,6 +32,8 @@ struct Fixture {
     expect_stage: String,
     expect_reason: String,
     expect_in_grace_period: bool,
+    expect_has_entitlements: bool,
+    expect_entitlements: serde_json::Map<String, serde_json::Value>,
 }
 
 fn parse_rfc3339(s: &str) -> SystemTime {
@@ -171,6 +174,92 @@ fn run_one(f: &Fixture) -> Result<(), String> {
             "in_grace_period mismatch: got {in_grace}, want {}",
             f.expect_in_grace_period
         ));
+    }
+
+    // Through the public check_license_at rather than the decoder, so this
+    // covers the wiring an application actually gets back, not just the
+    // parsing. It re-runs verify+validate, which for an accepted fixture is
+    // cheap and cannot fail.
+    let public = check_license_at(&master_pub, &f.token, &chain, &f.machine_id, now)
+        .map_err(|e| format!("check_license_at failed on an accepted fixture: {e}"))?;
+    assert_entitlements(&public, f)?;
+
+    Ok(())
+}
+
+/// Checks the shared entitlement contract from `latte-testvectors/README.md`
+/// against one fixture.
+///
+/// It asserts the *accessors*, not just the map, because the map is the
+/// easy half: the rules that actually split implementations are the ones
+/// about input an SDK does not like — a malformed value that must be
+/// dropped rather than errored on, and the two coercions (a falsy 0, a
+/// boolean read as 1) that must miss rather than convert.
+fn assert_entitlements(lic: &PublicLicense, f: &Fixture) -> Result<(), String> {
+    if lic.has_entitlements() != f.expect_has_entitlements {
+        return Err(format!(
+            "has_entitlements mismatch: got {}, want {}",
+            lic.has_entitlements(),
+            f.expect_has_entitlements
+        ));
+    }
+
+    let got_len = lic.entitlements.as_ref().map_or(0, |e| e.len());
+    if got_len != f.expect_entitlements.len() {
+        return Err(format!(
+            "entitlements mismatch: got {:?}, want {:?}",
+            lic.entitlements, f.expect_entitlements
+        ));
+    }
+
+    for (key, want) in &f.expect_entitlements {
+        match want {
+            serde_json::Value::Bool(want) => {
+                if lic.can(key) != *want {
+                    return Err(format!("can({key:?}) = {}, want {want}", lic.can(key)));
+                }
+                // No coercion: a boolean is not 1 or 0.
+                if let Some(got) = lic.limit(key) {
+                    return Err(format!(
+                        "limit({key:?}) = {got} on a boolean entitlement, want a miss"
+                    ));
+                }
+            }
+            serde_json::Value::Number(want) => {
+                let want = want.as_i64().ok_or("non-integer in expect_entitlements")?;
+                match lic.limit(key) {
+                    None => return Err(format!("limit({key:?}) missed, want {want}")),
+                    Some(got) if got != want => {
+                        return Err(format!("limit({key:?}) = {got}, want {want}"))
+                    }
+                    Some(got) if want == UNLIMITED && got != UNLIMITED => {
+                        return Err(format!(
+                            "limit({key:?}) = {got}, want the UNLIMITED sentinel {UNLIMITED}"
+                        ))
+                    }
+                    Some(_) => {}
+                }
+                // No coercion: an integer is not truthy, not even a non-zero one.
+                if lic.can(key) {
+                    return Err(format!(
+                        "can({key:?}) = true on an integer entitlement, want false"
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "expect_entitlements[{key:?}] is {other}, but the format admits only bool and integer"
+                ))
+            }
+        }
+    }
+
+    // Absence denies, whether or not the claim was there at all.
+    if lic.can("no_such_entitlement_key") {
+        return Err("can() on an unset key returned true; absence must deny".into());
+    }
+    if lic.limit("no_such_entitlement_key").is_some() {
+        return Err("limit() on an unset key reported present; absence must deny".into());
     }
 
     Ok(())

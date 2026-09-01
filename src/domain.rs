@@ -1,3 +1,4 @@
+use crate::entitlements::EntitlementValue;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
@@ -48,6 +49,11 @@ pub struct License {
     pub grace_period: Duration,
     pub license_type: LicenseType,
     pub metadata: HashMap<String, String>,
+    /// The decoded `ent` claim, or `None` when the token carried no such
+    /// claim at all — a different thing from an empty map, and the
+    /// distinction `PublicLicense::has_entitlements` reports. See the
+    /// [`crate::entitlements`] module.
+    pub entitlements: Option<HashMap<String, EntitlementValue>>,
 }
 
 /// The three-JWT certificate chain: Master (implicit, the caller-supplied

@@ -143,8 +143,26 @@ pub fn check_license_at(
     machine_id: &str,
     now: SystemTime,
 ) -> Result<PublicLicense, CheckError> {
-    let license: License =
-        verify::verify_activation_at(master_pub, token, chain, now).map_err(CheckError::Verify)?;
+    check_license_any_at(
+        std::slice::from_ref(master_pub),
+        token,
+        chain,
+        machine_id,
+        now,
+    )
+}
+
+/// [`check_license_at`], trusting any one of `master_pubs`. Pass
+/// [`verify::master_public_keys`] to trust the same roots `Sdk` does.
+pub fn check_license_any_at(
+    master_pubs: &[ed25519_dalek::VerifyingKey],
+    token: &str,
+    chain: &CertChain,
+    machine_id: &str,
+    now: SystemTime,
+) -> Result<PublicLicense, CheckError> {
+    let license: License = verify::verify_activation_any_at(master_pubs, token, chain, now)
+        .map_err(CheckError::Verify)?;
     validate::validate_at(&license, machine_id, now).map_err(CheckError::Validate)?;
 
     let in_grace = validate::in_grace_period(&license, now);

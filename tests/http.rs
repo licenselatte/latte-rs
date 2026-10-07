@@ -24,6 +24,8 @@
 //! `src/storage.rs`'s own unit tests separately cover the cache file
 //! format/atomicity in isolation, with no key material involved at all.
 
+#![cfg(all(feature = "http", feature = "cache"))]
+
 use latte_rs::error::LatteError;
 use latte_rs::http::{Config, Sdk};
 use latte_rs::storage;
@@ -66,6 +68,7 @@ async fn activate_sends_the_documented_request_shape() {
             "project_key": TEST_APP_ID,
             "license_key": TEST_LICENSE_KEY,
             "machine_id": TEST_MACHINE_ID,
+            "sdk": {"language": "rust", "version": env!("CARGO_PKG_VERSION")},
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "token": "not-a-real-jwt",
@@ -97,6 +100,7 @@ async fn renew_sends_the_documented_request_shape_without_project_key() {
             "activation_id": activation_id,
             "license_key": TEST_LICENSE_KEY,
             "machine_id": TEST_MACHINE_ID,
+            "sdk": {"language": "rust", "version": env!("CARGO_PKG_VERSION")},
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "token": "not-a-real-jwt",
@@ -259,6 +263,7 @@ async fn non_native_format_key_reaches_the_network_instead_of_being_rejected_loc
             "project_key": TEST_APP_ID,
             "license_key": "ACMELEGACY2019KEY",
             "machine_id": TEST_MACHINE_ID,
+            "sdk": {"language": "rust", "version": env!("CARGO_PKG_VERSION")},
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "token": "not-a-real-jwt",

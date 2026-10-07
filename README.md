@@ -29,7 +29,8 @@ Each link in the chain is a standard compact-serialization JWT
 signed with Ed25519, see [RFC 8037]). Verifying a license means:
 
 1. Verify the submaster cert's signature against the hardcoded master public
-   key, extract the submaster's own public key from its `spk` claim.
+   keys (any one of them may have signed it), extract the submaster's own
+   public key from its `spk` claim.
 2. Verify the project cert's signature against the submaster's public key,
    extract `ppk`.
 3. Verify the daily cert's signature against the project's public key,
@@ -44,7 +45,8 @@ signed with Ed25519, see [RFC 8037]). Verifying a license means:
 This is a standard certificate-chain-of-trust design (the same shape as an
 X.509 chain, just JWTs instead of X.509 certs), documented publicly here per
 Kerckhoffs's principle: the *mechanism* is not the secret, the master
-private key is. This SDK ships only the master **public** key; key rotation
+private key is. This SDK ships only the master **public** keys
+(`verify::MASTER_PUBLIC_KEYS_HEX`); key rotation
 cadence, key storage, and the tooling that issues certs are intentionally
 not documented in any SDK repo.
 
@@ -136,17 +138,19 @@ fn on_startup(sdk: &latte_rs::Sdk, machine_id: &str) {
 ## Re-verifying a token you're storing yourself
 
 If you'd rather manage persistence yourself instead of using the `cache`
-feature, `check_license_at` runs the same verify+validate pipeline
-`Sdk::activate`/`Sdk::check` do, against a token/chain you already have:
+feature, `check_license_any_at` runs the same verify+validate pipeline
+`Sdk::activate`/`Sdk::check` do, against a token/chain you already have.
+Pass it `verify::master_public_keys()` to trust the same roots `Sdk` does:
 
 ```rust
-use latte_rs::{check_license_at, CheckError};
+use latte_rs::{check_license_any_at, CheckError};
 use latte_rs::domain::CertChain;
-use ed25519_dalek::VerifyingKey;
+use latte_rs::verify::master_public_keys;
 use std::time::SystemTime;
 
-fn check(master_pub: &VerifyingKey, token: &str, chain: &CertChain, machine_id: &str) {
-    match check_license_at(master_pub, token, chain, machine_id, SystemTime::now()) {
+fn check(token: &str, chain: &CertChain, machine_id: &str) {
+    let masters = master_public_keys();
+    match check_license_any_at(&masters, token, chain, machine_id, SystemTime::now()) {
         Ok(lic) => {
             println!("license OK, expires {:?}", lic.expires_at);
             if lic.in_grace_period {
@@ -165,7 +169,7 @@ fn check(master_pub: &VerifyingKey, token: &str, chain: &CertChain, machine_id: 
 }
 ```
 
-`check_license_at` takes an explicit `now: SystemTime` rather than reading
+`check_license_any_at` takes an explicit `now: SystemTime` rather than reading
 the system clock internally. That's what makes this crate's test suite
 fully reproducible against a fixed set of test vectors, and it also lets
 you (if you ever need to) reject certificates whose validity window

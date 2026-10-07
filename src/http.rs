@@ -27,16 +27,12 @@ use crate::error::LatteError;
 use crate::key::{normalize_key, sanitize_key};
 #[cfg(feature = "cache")]
 use crate::validate::{in_grace_period, validate_at};
+use crate::verify::master_public_keys;
 #[cfg(feature = "cache")]
-use crate::verify::verify_activation_at;
-use crate::{check_license_at, PublicLicense};
+use crate::verify::verify_activation_any_at;
+use crate::{check_license_any_at, PublicLicense};
 #[cfg(feature = "cache")]
 use crate::{error::ValidateError, storage, CheckError};
-
-/// The Ed25519 public key used to verify every certificate chain. This is
-/// a public key, not a secret; it's meant to be embedded in every SDK.
-const MASTER_PUBLIC_KEY_HEX: &str =
-    "6773cdfdfb7fc44f13f097449b715e7147a2d73f525d9f09a8d25229e458a2fb";
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -132,7 +128,7 @@ pub struct Sdk {
     base_url: String,
     app_id: String,
     http: reqwest::Client,
-    master_pub: VerifyingKey,
+    master_pubs: Vec<VerifyingKey>,
     #[cfg(feature = "cache")]
     cache_path: Option<std::path::PathBuf>,
 }
@@ -145,14 +141,6 @@ impl Sdk {
     /// as `LatteError::Network` rather than panicking.
     pub fn new(config: Config) -> Result<Self, LatteError> {
         let parsed = parse_app_id(&config.app_id)?;
-
-        let master_bytes =
-            hex::decode(MASTER_PUBLIC_KEY_HEX).expect("MASTER_PUBLIC_KEY_HEX is valid hex");
-        let master_arr: [u8; 32] = master_bytes
-            .try_into()
-            .expect("MASTER_PUBLIC_KEY_HEX decodes to 32 bytes");
-        let master_pub = VerifyingKey::from_bytes(&master_arr)
-            .expect("MASTER_PUBLIC_KEY_HEX is a valid Ed25519 public key");
 
         let http = reqwest::Client::builder()
             .timeout(config.timeout.unwrap_or(DEFAULT_TIMEOUT))
@@ -171,7 +159,7 @@ impl Sdk {
                 .unwrap_or_else(|| parsed.env.base_url().to_string()),
             app_id: config.app_id,
             http,
-            master_pub,
+            master_pubs: master_public_keys(),
             #[cfg(feature = "cache")]
             cache_path,
         })
@@ -220,6 +208,7 @@ impl Sdk {
             project_key: &self.app_id,
             license_key: &normalized,
             machine_id,
+            sdk: SDK_INFO,
         };
         let (token, chain) = self
             .post_and_handle_invalidation("/v1/activate", &body)
@@ -249,6 +238,7 @@ impl Sdk {
             activation_id,
             license_key,
             machine_id,
+            sdk: SDK_INFO,
         };
         let (token, chain) = self
             .post_and_handle_invalidation("/v1/renew", &body)
@@ -280,8 +270,8 @@ impl Sdk {
             return Err(LatteError::NotActivated);
         };
 
-        match check_license_at(
-            &self.master_pub,
+        match check_license_any_at(
+            &self.master_pubs,
             &token,
             &chain,
             machine_id,
@@ -315,7 +305,7 @@ impl Sdk {
     fn cached_license(&self, machine_id: &str) -> Option<(PublicLicense, String)> {
         let (token, chain) = storage::load(self.cache_path.as_deref()?)?;
         let now = SystemTime::now();
-        let license = verify_activation_at(&self.master_pub, &token, &chain, now).ok()?;
+        let license = verify_activation_any_at(&self.master_pubs, &token, &chain, now).ok()?;
         validate_at(&license, machine_id, now).ok()?;
         let in_grace = in_grace_period(&license, now);
         let alias = license.alias.clone();
@@ -344,8 +334,8 @@ impl Sdk {
         chain: &CertChain,
         machine_id: &str,
     ) -> Result<PublicLicense, LatteError> {
-        check_license_at(
-            &self.master_pub,
+        check_license_any_at(
+            &self.master_pubs,
             token,
             chain,
             machine_id,
@@ -427,11 +417,25 @@ impl Sdk {
     }
 }
 
+/// Which SDK made a request, sent in the body of every activate/renew so
+/// the server can tell SDK releases apart.
+#[derive(Serialize, Clone, Copy)]
+struct SdkInfo {
+    language: &'static str,
+    version: &'static str,
+}
+
+const SDK_INFO: SdkInfo = SdkInfo {
+    language: "rust",
+    version: env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Serialize)]
 struct ActivateRequest<'a> {
     project_key: &'a str,
     license_key: &'a str,
     machine_id: &'a str,
+    sdk: SdkInfo,
 }
 
 #[derive(Serialize)]
@@ -439,6 +443,7 @@ struct RenewRequest<'a> {
     activation_id: &'a str,
     license_key: &'a str,
     machine_id: &'a str,
+    sdk: SdkInfo,
 }
 
 #[derive(Deserialize)]

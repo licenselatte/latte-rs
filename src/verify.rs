@@ -39,18 +39,73 @@ fn unix_to_system_time(secs: i64) -> SystemTime {
     }
 }
 
-/// Verifies the full chain and the activation token, evaluating time-based
-/// claims as of `now`. Production callers should pass `SystemTime::now()`;
-/// tests pass a fixture's pinned `now` so results are reproducible (see
-/// `latte-testvectors/README.md`).
+/// The Ed25519 master public keys LicenseLatte signs submaster certs with,
+/// hex-encoded. These are public keys, not secrets; every SDK embeds them,
+/// and a chain is trusted if any one of them signed its submaster cert.
+/// `Sdk` verifies against all of them; pass [`master_public_keys`] to
+/// [`verify_activation_any_at`] or [`crate::check_license_any_at`] to do the
+/// same when verifying a token you store yourself.
+pub const MASTER_PUBLIC_KEYS_HEX: [&str; 4] = [
+    // Root on YubiKey 32493801, trusted until the submaster cert it signed
+    // expires on 2026-12-11.
+    // Fingerprint: 49C1CA77D17984E0D25C0994D626409AD567D479
+    "6773cdfdfb7fc44f13f097449b715e7147a2d73f525d9f09a8d25229e458a2fb",
+    // root-a, YubiKey 40127477.
+    // Fingerprint: B89594D5DD7B9213E5FC7DC27FC9430452C9F38D
+    // Authentication subkey: A53549AF5B5570F304D4342D702AEFFF07B512EF
+    "73358e45a5c77b7f7236d26f5a1756011b522d277bb19ac4869d2e88952705cd",
+    // root-b, YubiKey 40127498.
+    // Fingerprint: A980BA5DD0B3831A4038D22C744D413D801A1AFA
+    // Authentication subkey: B217F9743D6FD3EB21FF87D83752947C4AD9CC5E
+    "4f9369b8a4a0fd9be67cd403e4ed92e0d45609772659be4a066c1a9c4eff43fe",
+    // root-c, YubiKey 40127484.
+    // Fingerprint: 7F3CC680FF472FCF9A351CAF8204C38EAF10DA14
+    // Authentication subkey: 59282CA469B7E8168952E07476352E58361B3A92
+    "46d45bbc3280df763fcaf7a37055888eeefbb5781784c1f471f4f413d72b123f",
+];
+
+/// [`MASTER_PUBLIC_KEYS_HEX`], parsed.
+pub fn master_public_keys() -> Vec<VerifyingKey> {
+    MASTER_PUBLIC_KEYS_HEX
+        .iter()
+        .map(|h| {
+            let bytes = hex::decode(h).expect("MASTER_PUBLIC_KEYS_HEX is valid hex");
+            pub_key_from_bytes(&bytes).expect("MASTER_PUBLIC_KEYS_HEX holds Ed25519 keys")
+        })
+        .collect()
+}
+
+/// Verifies the full chain and the activation token against a single
+/// master public key, evaluating time-based claims as of `now`. Production
+/// callers should pass `SystemTime::now()`; tests pass a fixture's pinned
+/// `now` so results are reproducible (see `latte-testvectors/README.md`).
 pub fn verify_activation_at(
     master_pub: &VerifyingKey,
     token: &str,
     chain: &CertChain,
     now: SystemTime,
 ) -> Result<License, VerifyError> {
-    // Step 1: submaster cert, signed by master.
-    let sub = parse_and_verify(&chain.submaster, master_pub, ISSUER, now)?;
+    verify_activation_any_at(std::slice::from_ref(master_pub), token, chain, now)
+}
+
+/// [`verify_activation_at`], trusting a chain whose submaster cert was
+/// signed by any one of `master_pubs`. When none of them verifies it, the
+/// error is the one the last key produced.
+pub fn verify_activation_any_at(
+    master_pubs: &[VerifyingKey],
+    token: &str,
+    chain: &CertChain,
+    now: SystemTime,
+) -> Result<License, VerifyError> {
+    // Step 1: submaster cert, signed by any trusted master.
+    let mut sub = Err(VerifyError::InvalidSignature);
+    for master_pub in master_pubs {
+        sub = parse_and_verify(&chain.submaster, master_pub, ISSUER, now);
+        if sub.is_ok() {
+            break;
+        }
+    }
+    let sub = sub?;
     let submaster_pub = pub_key_from_cert(&sub.claims, "spk")?;
 
     // Step 2: project cert, signed by submaster.

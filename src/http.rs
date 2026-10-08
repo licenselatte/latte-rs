@@ -25,6 +25,7 @@ use crate::appid::parse_app_id;
 use crate::domain::CertChain;
 use crate::error::LatteError;
 use crate::key::{normalize_key, sanitize_key};
+use crate::machine_id;
 #[cfg(feature = "cache")]
 use crate::validate::{in_grace_period, validate_at};
 use crate::verify::master_public_keys;
@@ -82,6 +83,21 @@ pub struct Config {
     /// choosing instead (or to point tests at a temp directory).
     #[cfg(feature = "cache")]
     pub cache_path: Option<std::path::PathBuf>,
+    /// Replaces the platform's machine ID as the identity of this install.
+    /// `None` (or an empty string) reads the platform's machine ID.
+    ///
+    /// Either way the raw value never leaves the machine: the SDK sends
+    /// lowercase hex `HMAC-SHA256(key = raw ID, message = "licenselatte_" +
+    /// app_id)`, with a supplied value used byte for byte, without
+    /// trimming. See [`crate::machine_id`].
+    ///
+    /// Set it when the platform ID does not identify what you want to count
+    /// as one seat: containers that share their image's `/etc/machine-id`
+    /// or have none, cloned VMs that share one ID, apps that want a seat per
+    /// user rather than per machine, and tests. Changing it on an install
+    /// that is already activated makes that install a new machine, which
+    /// takes a new seat.
+    pub machine_id: Option<String>,
 }
 
 impl Config {
@@ -119,6 +135,13 @@ impl Config {
         self.cache_path = Some(cache_path.into());
         self
     }
+
+    /// Supplies the raw machine ID in place of the platform's. See
+    /// [`Config::machine_id`] for when to use it.
+    pub fn with_machine_id(mut self, machine_id: impl Into<String>) -> Self {
+        self.machine_id = Some(machine_id.into());
+        self
+    }
 }
 
 /// Activates and renews licenses over the network, with an optional local
@@ -127,6 +150,7 @@ impl Config {
 pub struct Sdk {
     base_url: String,
     app_id: String,
+    machine_id: String,
     http: reqwest::Client,
     master_pubs: Vec<VerifyingKey>,
     #[cfg(feature = "cache")]
@@ -135,12 +159,17 @@ pub struct Sdk {
 
 impl Sdk {
     /// Parses and checksum-validates `config.app_id`, returning
-    /// `LatteError::InvalidAppId` on failure. Building the underlying HTTP
+    /// `LatteError::InvalidAppId` on failure, then derives this install's
+    /// machine ID (see [`Config::machine_id`]), returning
+    /// `LatteError::MachineIdUnavailable` when the platform's cannot be read
+    /// and none was supplied. Building the underlying HTTP
     /// client can only fail on an invalid TLS/proxy configuration, which
     /// can't happen with this crate's own defaults, but is still surfaced
     /// as `LatteError::Network` rather than panicking.
     pub fn new(config: Config) -> Result<Self, LatteError> {
         let parsed = parse_app_id(&config.app_id)?;
+        let machine_id = machine_id::derive(&config.app_id, config.machine_id.as_deref())
+            .ok_or(LatteError::MachineIdUnavailable)?;
 
         let http = reqwest::Client::builder()
             .timeout(config.timeout.unwrap_or(DEFAULT_TIMEOUT))
@@ -158,6 +187,7 @@ impl Sdk {
                 .base_url
                 .unwrap_or_else(|| parsed.env.base_url().to_string()),
             app_id: config.app_id,
+            machine_id,
             http,
             master_pubs: master_public_keys(),
             #[cfg(feature = "cache")]
@@ -165,7 +195,15 @@ impl Sdk {
         })
     }
 
-    /// Activates `license_key` for `machine_id`.
+    /// The machine ID this SDK sends and checks tokens against: the
+    /// HMAC-derived value, never the raw ID. Pass it to
+    /// [`crate::check_license_at`] and the other low-level functions when
+    /// you verify a token yourself.
+    pub fn machine_id(&self) -> &str {
+        &self.machine_id
+    }
+
+    /// Activates `license_key` on this machine.
     ///
     /// The key is normalized and given a minimal sanity check (non-empty,
     /// not implausibly long) before ever reaching the network — a license
@@ -188,11 +226,8 @@ impl Sdk {
     /// that fails local verification/validation surfaces as
     /// `LatteError::Server`, not one of the sentinel variants (those are
     /// reserved for the server's HTTP status code itself).
-    pub async fn activate(
-        &self,
-        license_key: &str,
-        machine_id: &str,
-    ) -> Result<PublicLicense, LatteError> {
+    pub async fn activate(&self, license_key: &str) -> Result<PublicLicense, LatteError> {
+        let machine_id = self.machine_id.as_str();
         let sanitized = sanitize_key(license_key);
         let normalized = normalize_key(license_key);
         self.validate_license_key(&normalized)?;
@@ -232,8 +267,8 @@ impl Sdk {
         &self,
         activation_id: &str,
         license_key: &str,
-        machine_id: &str,
     ) -> Result<PublicLicense, LatteError> {
+        let machine_id = self.machine_id.as_str();
         let body = RenewRequest {
             activation_id,
             license_key,
@@ -249,7 +284,7 @@ impl Sdk {
         Ok(lic)
     }
 
-    /// Reads the cached activation for `machine_id` without making a
+    /// Reads the cached activation for this machine without making a
     /// network call. Requires the `cache` feature.
     ///
     /// Returns `LatteError::LicenseExpired` if there's a cached token but
@@ -262,7 +297,7 @@ impl Sdk {
     /// their own sentinel because the caller's correct response to all of
     /// them is the same: activate again.
     #[cfg(feature = "cache")]
-    pub fn check(&self, machine_id: &str) -> Result<PublicLicense, LatteError> {
+    pub fn check(&self) -> Result<PublicLicense, LatteError> {
         let Some(path) = &self.cache_path else {
             return Err(LatteError::NotActivated);
         };
@@ -274,7 +309,7 @@ impl Sdk {
             &self.master_pubs,
             &token,
             &chain,
-            machine_id,
+            &self.machine_id,
             SystemTime::now(),
         ) {
             Ok(lic) => Ok(lic),

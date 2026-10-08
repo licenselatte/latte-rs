@@ -8,10 +8,10 @@
 //!
 //! Everything below `Sdk`, chain verification (`verify`), grace-period
 //! validation (`validate`), and license-key/AppID normalization (`key`,
-//! `appid`), has no dependencies beyond `serde`/`ed25519-dalek` and works
-//! the same with both features disabled; machine-ID fingerprinting is left
-//! to the integrator (an OS fingerprint is out of this crate's scope,
-//! only the requirement that it's an opaque string is).
+//! `appid`), has no dependencies beyond `serde`/`ed25519-dalek`/`sha2` and
+//! works the same with both features disabled. Those functions take the
+//! derived machine ID (`Sdk::machine_id`, or [`machine_id::derive`] without
+//! `Sdk`), never a raw one.
 //!
 //! No `unsafe` appears anywhere in this crate.
 
@@ -23,6 +23,7 @@ pub mod error;
 pub mod http;
 mod jwt;
 pub mod key;
+pub mod machine_id;
 #[cfg(feature = "cache")]
 pub mod storage;
 pub mod validate;

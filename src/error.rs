@@ -127,6 +127,11 @@ pub enum LatteError {
     InvalidProjectKey,
     #[error(transparent)]
     InvalidAppId(#[from] AppIdError),
+    /// `Sdk::new` could not read this platform's machine ID and
+    /// `Config::machine_id` was not set. Supply one with
+    /// `Config::with_machine_id`.
+    #[error("cannot determine machine ID; set Config::machine_id")]
+    MachineIdUnavailable,
     /// Reserved for a future explicit cache-management API; nothing
     /// currently returns this, cache I/O failures are handled by falling
     /// back to the network (or, for `check`, to `NotActivated`) rather

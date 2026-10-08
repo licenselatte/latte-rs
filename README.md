@@ -100,14 +100,14 @@ async fn main() {
     let sdk = Sdk::new(Config::with_app_id("pk_live_..."))
         .expect("invalid app_id");
 
-    match sdk.activate("USER-PROVIDED-LICENSE-KEY", "opaque-machine-id").await {
+    match sdk.activate("USER-PROVIDED-LICENSE-KEY").await {
         Ok(lic) => {
             println!("license OK, expires {:?}", lic.expires_at);
             if lic.in_grace_period {
                 println!("warning: offline a while, please reconnect soon");
             }
             // Keep `lic.activation_id` around (in your own storage) so you
-            // can call `sdk.renew(&lic.activation_id, ...)` later.
+            // can call `sdk.renew(&lic.activation_id, &key)` later.
         }
         Err(e) => eprintln!("activation failed: {e}"),
     }
@@ -120,13 +120,47 @@ the cached result without a network round trip as long as it's still
 valid. There's no background renewal thread; call `renew` yourself on
 whatever schedule fits your application.
 
+## Machine ID
+
+`Sdk::new` works out this install's machine ID once, and `activate`,
+`renew` and `check` all use it. The raw ID never leaves the machine: what
+is sent, and compared with the token's `mid` claim, is lowercase hex
+`HMAC-SHA256(key = raw ID, message = "licenselatte_" + app_id)`, the same
+value latte-go sends. The raw ID is the platform's machine ID
+(`/var/lib/dbus/machine-id` or `/etc/machine-id` on Linux, `IOPlatformUUID`
+on macOS, `MachineGuid` on Windows, `/etc/hostid` or the SMBIOS UUID on the
+BSDs) unless you supply your own:
+
+```rust
+use latte_rs::{Config, Sdk};
+
+let sdk = Sdk::new(Config::with_app_id("pk_live_...").with_machine_id(user_id))?;
+```
+
+A supplied ID is used byte for byte, without trimming. Supply one when the
+platform ID does not identify what you want to count as one seat:
+
+- containers that share their image's `/etc/machine-id`, or have none;
+- cloned VMs that all carry the same ID;
+- a seat per user rather than per machine;
+- tests.
+
+Changing it on an install that is already activated makes that install a
+new machine, which takes a new seat. When no ID was supplied and the
+platform's cannot be read, `Sdk::new` returns
+`LatteError::MachineIdUnavailable`.
+
+`Sdk::machine_id()` returns the derived value, which is what the low-level
+functions below take. Without the `http` feature, compute it with
+`latte_rs::machine_id::derive(app_id, raw)`.
+
 ## Checking a cached activation without a network call
 
 ```rust
 use latte_rs::error::LatteError;
 
-fn on_startup(sdk: &latte_rs::Sdk, machine_id: &str) {
-    match sdk.check(machine_id) {
+fn on_startup(sdk: &latte_rs::Sdk) {
+    match sdk.check() {
         Ok(lic) => println!("license OK, expires {:?}", lic.expires_at),
         Err(LatteError::LicenseExpired) => eprintln!("license expired, please renew"),
         Err(LatteError::NotActivated) => eprintln!("not activated, call activate()"),
@@ -140,7 +174,8 @@ fn on_startup(sdk: &latte_rs::Sdk, machine_id: &str) {
 If you'd rather manage persistence yourself instead of using the `cache`
 feature, `check_license_any_at` runs the same verify+validate pipeline
 `Sdk::activate`/`Sdk::check` do, against a token/chain you already have.
-Pass it `verify::master_public_keys()` to trust the same roots `Sdk` does:
+Pass it `verify::master_public_keys()` to trust the same roots `Sdk` does,
+and `Sdk::machine_id()` (or `machine_id::derive`) as the machine ID:
 
 ```rust
 use latte_rs::{check_license_any_at, CheckError};
@@ -247,7 +282,7 @@ their customer bought. Two questions, and only two: *may this customer do X*
 (a boolean) and *how many Y do they get* (an integer).
 
 ```rust
-let lic = sdk.activate(&key, &machine_id)?;
+let lic = sdk.activate(&key)?;
 
 if lic.can("export_pdf") {
     enable_pdf_export();
@@ -320,13 +355,9 @@ it server-side.
 
 ## What this crate does *not* do
 
-OS-level machine-ID fingerprinting and background renewal scheduling are
-intentionally out of scope. Pass your own machine-ID string into
-`activate`/`renew`/`check`/`check_license_at`; only the opaque string
-compared against the token's `mid` claim matters, not the algorithm that
-produces it. For renewal, there's no scheduler here; `Sdk::renew` is the
-building block; call it on a timer, in response to a UI action, or
-whatever fits your application.
+Background renewal scheduling is intentionally out of scope. There's no
+scheduler here; `Sdk::renew` is the building block; call it on a timer, in
+response to a UI action, or whatever fits your application.
 
 ## Testing
 

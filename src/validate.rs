@@ -36,18 +36,6 @@ pub fn validate_at(
         ));
     }
 
-    // perpetual_fixed tokens never expire and have no grace-period check,
-    // but the four preconditions above still apply unconditionally,
-    // including grace_period > 0, even though it's otherwise unused for
-    // this type: the checks run before the branch on LicenseType.
-    if license.license_type.is_perpetual_fixed() {
-        return if now > license.expires_at {
-            Err(ValidateError::HardExpired)
-        } else {
-            Ok(())
-        };
-    }
-
     let offline_deadline = license.issued_at + license.grace_period;
 
     if now > license.expires_at {
@@ -178,26 +166,16 @@ mod tests {
     }
 
     #[test]
-    fn perpetual_fixed_still_requires_positive_grace_period() {
+    #[allow(deprecated)]
+    fn perpetual_fixed_is_held_to_the_grace_deadline() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
         let mut lic = base_license(now);
         lic.license_type = LicenseType::PerpetualFixed;
-        lic.grace_period = Duration::ZERO;
-        assert!(matches!(
-            validate_at(&lic, "M", now),
-            Err(ValidateError::InvalidFields(_))
-        ));
-    }
-
-    #[test]
-    fn perpetual_fixed_skips_grace_deadline_but_not_hard_expiry() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
-        let mut lic = base_license(now);
-        lic.license_type = LicenseType::PerpetualFixed;
-        // now is already past issued_at+grace_period, which would normally
-        // be GraceExpired, but perpetual_fixed doesn't check that at all.
         let check_at = lic.issued_at + lic.grace_period + Duration::from_secs(1);
-        assert!(validate_at(&lic, "M", check_at).is_ok());
+        assert_eq!(
+            validate_at(&lic, "M", check_at),
+            Err(ValidateError::GraceExpired)
+        );
     }
 
     #[test]
@@ -223,15 +201,6 @@ mod tests {
         let deadline = lic.issued_at + lic.grace_period;
         assert!(is_valid(&lic, deadline));
         assert!(!is_valid(&lic, deadline + Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn perpetual_fixed_still_hard_expires() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
-        let mut lic = base_license(now);
-        lic.license_type = LicenseType::PerpetualFixed;
-        lic.expires_at = now - Duration::from_secs(1);
-        assert_eq!(validate_at(&lic, "M", now), Err(ValidateError::HardExpired));
     }
 
     #[test]

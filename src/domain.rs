@@ -4,9 +4,10 @@ use std::time::{Duration, SystemTime};
 
 /// The policy type of a verified license, from the token's `ltype` claim.
 /// Unrecognized strings round-trip through `Other` rather than erroring,
-/// since validation treats any non-`perpetual_fixed` value identically.
+/// since validation treats every license type identically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LicenseType {
+    #[deprecated(note = "validated like every other license type; the server no longer issues it")]
     PerpetualFixed,
     Perpetual,
     Expiring,
@@ -14,6 +15,7 @@ pub enum LicenseType {
 }
 
 impl LicenseType {
+    #[allow(deprecated)]
     pub fn from_claim(s: &str) -> Self {
         match s {
             "perpetual_fixed" => LicenseType::PerpetualFixed,
@@ -23,6 +25,8 @@ impl LicenseType {
         }
     }
 
+    #[deprecated(note = "validation does not depend on the license type")]
+    #[allow(deprecated)]
     pub fn is_perpetual_fixed(&self) -> bool {
         matches!(self, LicenseType::PerpetualFixed)
     }

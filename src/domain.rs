@@ -39,6 +39,8 @@ pub struct License {
     pub project_id: String,
     pub machine_id: String,
     pub issued_at: SystemTime,
+    /// The licence's end date; 2099-01-01T00:00:00Z for a licence that
+    /// never ends.
     pub expires_at: SystemTime,
     pub grace_period: Duration,
     pub license_type: LicenseType,

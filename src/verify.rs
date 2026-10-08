@@ -15,6 +15,10 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 const ISSUER: &str = "licenselatte";
+/// The `expires_at` of a licence that never ends: 2099-01-01T00:00:00Z,
+/// the `exp` a `grc` token carries for a perpetual licence, so a token
+/// without `lex` reads the same as one in the `grc` format.
+const NO_LICENCE_END: i64 = 4_070_908_800;
 const MAX_GRACE_PERIOD: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 fn pub_key_from_bytes(bytes: &[u8]) -> Result<VerifyingKey, VerifyError> {
@@ -123,8 +127,9 @@ pub fn verify_activation_any_at(
     let daily_pub = pub_key_from_cert(&daily.claims, "dpk")?;
 
     // Step 4: activation JWT, signed by the daily key. Verification applies
-    // effectively-infinite leeway here; the activation's own iat/exp/nbf are
-    // not authoritative, the grace-period math in validate.rs is.
+    // effectively-infinite leeway here, so an `exp` in the past never fails
+    // the parse: `exp` is enforced by validate.rs, which reports it as
+    // `HardExpired` or `GraceExpired`.
     let activation = parse_and_verify_with_infinite_leeway(token, &daily_pub, ISSUER)?;
     let claims = &activation.claims;
 
@@ -135,14 +140,23 @@ pub fn verify_activation_any_at(
     let machine_id = claim_str(claims, "mid").unwrap_or("").to_string();
     let license_type = LicenseType::from_claim(claim_str(claims, "ltype").unwrap_or(""));
 
-    let grc = claim_i64(claims, "grc").unwrap_or(0);
-    let grace_period = Duration::from_secs(grc.max(0) as u64);
-    let iat = claim_i64(claims, "iat")
-        .map(unix_to_system_time)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    let exp = claim_i64(claims, "exp")
-        .map(unix_to_system_time)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    // Two token formats, told apart by `grc` alone. With `grc`, `exp` is the
+    // licence's end and the offline deadline is `iat + grc`. Without it,
+    // `exp` is the offline deadline itself and `lex`, when present, is the
+    // licence's end. Either way the result is the same License shape, so
+    // validate.rs never needs to know which format it came from.
+    let iat_secs = claim_i64(claims, "iat").unwrap_or(0);
+    let exp_secs = claim_i64(claims, "exp").unwrap_or(0);
+    let (expires_at, grace_secs) = match claim_i64(claims, "grc") {
+        Some(grc) => (exp_secs, grc),
+        None => (
+            claim_i64(claims, "lex").unwrap_or(NO_LICENCE_END),
+            exp_secs - iat_secs,
+        ),
+    };
+    let grace_period = Duration::from_secs(grace_secs.max(0) as u64);
+    let iat = unix_to_system_time(iat_secs);
+    let expires_at = unix_to_system_time(expires_at);
 
     let entitlements = decode_entitlements(claims);
 
@@ -203,7 +217,7 @@ pub fn verify_activation_any_at(
         project_id,
         machine_id,
         issued_at: iat,
-        expires_at: exp,
+        expires_at,
         grace_period,
         license_type,
         metadata,

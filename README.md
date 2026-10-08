@@ -192,6 +192,19 @@ While `now <= issued_at + grace_period`, the license is still usable without
 a network call. Once that deadline passes, `check_license_at` returns
 `ValidateError::GraceExpired`; once `now > expires_at`, it returns
 `ValidateError::HardExpired` (checked first, hard expiry always wins).
+A licence that never ends has `expires_at` 2099-01-01T00:00:00Z.
+
+The SDK reads two activation-token formats, told apart by whether the
+token carries a `grc` claim:
+
+| Format | `expires_at` | `grace_period` |
+|---|---|---|
+| with `grc` | `exp` | `grc` |
+| without `grc` | `lex`, or 2099-01-01T00:00:00Z when absent | `exp - iat` |
+
+In the second format `exp` is the offline deadline itself, already capped
+at the licence's end by the server. Either way `exp` is enforced by the
+validate step above, with those two reasons, and never by the JWT parse.
 
 `PublicLicense::in_grace_period` is a softer, earlier warning signal: it
 turns `true` once more than 60 minutes have passed since the last

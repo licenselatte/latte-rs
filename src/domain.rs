@@ -7,28 +7,18 @@ use std::time::{Duration, SystemTime};
 /// since validation treats every license type identically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LicenseType {
-    #[deprecated(note = "validated like every other license type; the server no longer issues it")]
-    PerpetualFixed,
     Perpetual,
     Expiring,
     Other(String),
 }
 
 impl LicenseType {
-    #[allow(deprecated)]
     pub fn from_claim(s: &str) -> Self {
         match s {
-            "perpetual_fixed" => LicenseType::PerpetualFixed,
             "perpetual" => LicenseType::Perpetual,
             "expiring" => LicenseType::Expiring,
             other => LicenseType::Other(other.to_string()),
         }
-    }
-
-    #[deprecated(note = "validation does not depend on the license type")]
-    #[allow(deprecated)]
-    pub fn is_perpetual_fixed(&self) -> bool {
-        matches!(self, LicenseType::PerpetualFixed)
     }
 }
 

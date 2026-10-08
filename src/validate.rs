@@ -166,11 +166,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn perpetual_fixed_is_held_to_the_grace_deadline() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
         let mut lic = base_license(now);
-        lic.license_type = LicenseType::PerpetualFixed;
+        lic.license_type = LicenseType::Other("perpetual_fixed".to_string());
         let check_at = lic.issued_at + lic.grace_period + Duration::from_secs(1);
         assert_eq!(
             validate_at(&lic, "M", check_at),

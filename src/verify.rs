@@ -6,7 +6,10 @@
 use crate::domain::{CertChain, License, LicenseType};
 use crate::entitlements::decode_entitlements;
 use crate::error::VerifyError;
-use crate::jwt::{claim_i64, claim_str, parse_and_verify, parse_and_verify_with_infinite_leeway};
+use crate::jwt::{
+    claim_i64, claim_str, parse_and_verify, parse_and_verify_ignoring_expiry,
+    parse_and_verify_with_infinite_leeway,
+};
 use ed25519_dalek::VerifyingKey;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -112,8 +115,11 @@ pub fn verify_activation_any_at(
     let proj = parse_and_verify(&chain.project, &submaster_pub, ISSUER, now)?;
     let project_pub = pub_key_from_cert(&proj.claims, "ppk")?;
 
-    // Step 3: daily cert, signed by project key.
-    let daily = parse_and_verify(&chain.daily, &project_pub, ISSUER, now)?;
+    // Step 3: daily cert, signed by project key. Its exp is not checked
+    // against now: it expires the morning after it is issued, and the token
+    // it signed has to verify offline for its whole grace period. Its window
+    // bounds the token's iat instead, below.
+    let daily = parse_and_verify_ignoring_expiry(&chain.daily, &project_pub, ISSUER, now)?;
     let daily_pub = pub_key_from_cert(&daily.claims, "dpk")?;
 
     // Step 4: activation JWT, signed by the daily key. Verification applies
@@ -175,12 +181,8 @@ pub fn verify_activation_any_at(
         ));
     }
 
-    // Cross-check intended to ensure the activation doesn't outlive the
-    // daily cert that signed it. This compares the activation's iat against
-    // the daily cert's exp, not the activation's own exp as the error
-    // message below might suggest. That's deliberate: do not change this to
-    // compare `exp` without explicit sign-off, since it changes accept/reject
-    // outcomes for existing licenses.
+    // Cross-check: activation iat must not follow the daily cert's exp, so
+    // a daily key cannot sign tokens dated after its own day.
     if iat > daily_exp {
         return Err(VerifyError::ChainInconsistent(
             "activation JWT iat is after daily cert exp".into(),
@@ -416,6 +418,99 @@ mod tests {
         let err =
             verify_activation_at(&tc.master.verifying_key(), &token, &tc.chain, now_t).unwrap_err();
         assert!(matches!(err, VerifyError::ChainInconsistent(_)));
+    }
+
+    // Day 2026-10-07 00:00 UTC. The daily cert runs to 00:05 the next day,
+    // as the server issues it.
+    const DAY: i64 = 1_791_331_200;
+
+    fn chain_with_daily_day(day: i64) -> TestChain {
+        let master = random_signing_key();
+        let submaster = random_signing_key();
+        let project = random_signing_key();
+        let daily = random_signing_key();
+        // Submaster and project certs span 180 days, as the server issues them.
+        let (start, end) = (day - 30 * 86_400, day + 150 * 86_400);
+        let chain = CertChain {
+            submaster: sign_jwt(
+                &master,
+                json!({"iss": ISSUER, "iat": start, "exp": end, "spk": hex::encode(submaster.verifying_key().to_bytes())}),
+            ),
+            project: sign_jwt(
+                &submaster,
+                json!({"iss": ISSUER, "iat": start, "exp": end, "ppk": hex::encode(project.verifying_key().to_bytes()), "pid": "proj_1"}),
+            ),
+            daily: sign_jwt(
+                &project,
+                json!({"iss": ISSUER, "iat": day, "exp": day + 86_400 + 300, "dpk": hex::encode(daily.verifying_key().to_bytes())}),
+            ),
+        };
+        TestChain {
+            master,
+            project,
+            daily,
+            chain,
+        }
+    }
+
+    fn at(unix: i64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(unix as u64)
+    }
+
+    #[test]
+    fn cached_token_verifies_offline_across_the_day_boundary() {
+        let tc = chain_with_daily_day(DAY);
+        let iat = DAY + 23 * 3600 + 59 * 60; // activated at 23:59 UTC
+        let mut claims = activation_claims(iat);
+        claims["grc"] = json!(30 * 86_400);
+        let token = sign_jwt(&tc.daily, claims);
+        for offline in [60, 600, 86_400, 29 * 86_400] {
+            verify_activation_at(
+                &tc.master.verifying_key(),
+                &token,
+                &tc.chain,
+                at(iat + offline),
+            )
+            .unwrap_or_else(|e| panic!("offline {offline}s after activation: {e}"));
+        }
+    }
+
+    #[test]
+    fn token_dated_outside_the_daily_window_is_rejected() {
+        let tc = chain_with_daily_day(DAY);
+        for iat in [DAY - 60, DAY + 86_400 + 360] {
+            let token = sign_jwt(&tc.daily, activation_claims(iat));
+            let err =
+                verify_activation_at(&tc.master.verifying_key(), &token, &tc.chain, at(iat + 60))
+                    .unwrap_err();
+            assert!(
+                matches!(err, VerifyError::ChainInconsistent(_)),
+                "iat {iat}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn daily_cert_with_wrong_issuer_is_rejected() {
+        let mut tc = chain_with_daily_day(DAY);
+        tc.chain.daily = sign_jwt(
+            &tc.project,
+            json!({"iss": "someone-else", "iat": DAY, "exp": DAY + 86_700, "dpk": hex::encode(tc.daily.verifying_key().to_bytes())}),
+        );
+        let token = sign_jwt(&tc.daily, activation_claims(DAY + 60));
+        let err =
+            verify_activation_at(&tc.master.verifying_key(), &token, &tc.chain, at(DAY + 120))
+                .unwrap_err();
+        assert!(matches!(err, VerifyError::WrongIssuer));
+    }
+
+    #[test]
+    fn daily_cert_issued_in_the_future_is_rejected() {
+        let tc = chain_with_daily_day(DAY);
+        let token = sign_jwt(&tc.daily, activation_claims(DAY + 60));
+        let err = verify_activation_at(&tc.master.verifying_key(), &token, &tc.chain, at(DAY - 1))
+            .unwrap_err();
+        assert!(matches!(err, VerifyError::NotYetValid));
     }
 
     #[test]

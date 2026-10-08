@@ -22,18 +22,31 @@ pub struct ParsedJwt {
 /// Parses and Ed25519-verifies a compact JWT against `pub_key`, then
 /// validates `iss` and, with **zero leeway**, `iat`/`exp`/`nbf` if present.
 ///
-/// This zero-leeway behavior applies to the submaster/project/daily
-/// certs, which get no clock-skew tolerance at all. The activation token
-/// itself is parsed by a separate function
-/// (`parse_and_verify_with_infinite_leeway`), which applies an
-/// effectively-infinite leeway there instead.
+/// This zero-leeway behavior applies to the submaster and project certs,
+/// which get no clock-skew tolerance at all. The daily cert is parsed by
+/// `parse_and_verify_ignoring_expiry`, and the activation token by
+/// `parse_and_verify_with_infinite_leeway`.
 pub fn parse_and_verify(
     token: &str,
     pub_key: &VerifyingKey,
     expected_issuer: &str,
     now: SystemTime,
 ) -> Result<ParsedJwt, VerifyError> {
-    parse_and_verify_inner(token, pub_key, expected_issuer, now, 0)
+    parse_and_verify_inner(token, pub_key, expected_issuer, now, 0, true)
+}
+
+/// Same as `parse_and_verify`, but `exp` is not checked against `now`;
+/// `iat`/`nbf` still are, with zero leeway. Used for the daily cert, which
+/// expires the morning after it is issued while the activation token it
+/// signed has to verify offline for its whole grace period. The daily
+/// cert's window bounds the token's `iat` instead (see `verify.rs`).
+pub fn parse_and_verify_ignoring_expiry(
+    token: &str,
+    pub_key: &VerifyingKey,
+    expected_issuer: &str,
+    now: SystemTime,
+) -> Result<ParsedJwt, VerifyError> {
+    parse_and_verify_inner(token, pub_key, expected_issuer, now, 0, false)
 }
 
 /// Same as `parse_and_verify`, but `iat`/`exp`/`nbf` checks are skipped
@@ -51,6 +64,7 @@ pub fn parse_and_verify_with_infinite_leeway(
         expected_issuer,
         SystemTime::UNIX_EPOCH,
         u64::MAX,
+        false,
     )
 }
 
@@ -60,6 +74,7 @@ fn parse_and_verify_inner(
     expected_issuer: &str,
     now: SystemTime,
     leeway_secs: u64,
+    check_exp: bool,
 ) -> Result<ParsedJwt, VerifyError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -108,7 +123,7 @@ fn parse_and_verify_inner(
     }
 
     if leeway_secs != u64::MAX {
-        check_time_claims(&claims, now, leeway_secs)?;
+        check_time_claims(&claims, now, leeway_secs, check_exp)?;
     }
 
     Ok(ParsedJwt { claims })
@@ -118,6 +133,7 @@ fn check_time_claims(
     claims: &Map<String, Value>,
     now: SystemTime,
     leeway_secs: u64,
+    check_exp: bool,
 ) -> Result<(), VerifyError> {
     let now_unix = now
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -135,7 +151,7 @@ fn check_time_claims(
             return Err(VerifyError::NotYetValid);
         }
     }
-    if let Some(exp) = claim_as_i64(claims, "exp") {
+    if let Some(exp) = claim_as_i64(claims, "exp").filter(|_| check_exp) {
         if exp < now_unix - leeway {
             return Err(VerifyError::Expired);
         }

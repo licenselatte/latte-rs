@@ -19,7 +19,8 @@ pub enum VerifyError {
     /// The JWT's `iat` is after the verifier's current time (zero leeway
     /// for cert-chain links).
     NotYetValid,
-    /// The JWT's `exp` is before the verifier's current time (zero leeway).
+    /// The JWT's `exp` is before the verifier's current time (zero leeway;
+    /// submaster and project certs only).
     Expired,
     /// Cross-check between two certs in the chain failed (project_id
     /// mismatch, activation iat before daily cert iat, the

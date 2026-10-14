@@ -198,7 +198,7 @@ already went through is success, with `released` false.
 A machine that is lost, dead or wiped cannot call this; its seat is
 released from the seller's customer portal instead.
 
-The seller's deactivation policy may limit releases. A refusal is
+Releases are limited on every plan: a fixed number per licence per year, or on plans with the deactivation policy engine the seller's cooldown and yearly cap. A refusal is
 `LatteError::DeactivationBlocked { message, reason, available_at }`:
 `message` is written to be shown to the user, `reason` is
 `"deactivation_cooldown"` or `"deactivation_limit_reached"`, and

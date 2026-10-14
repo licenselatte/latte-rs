@@ -101,8 +101,8 @@ impl fmt::Display for AppIdError {
 
 impl std::error::Error for AppIdError {}
 
-/// Top-level error returned by `Sdk` (`activate`, `renew`, and, with the
-/// `cache` feature, `check`).
+/// Top-level error returned by `Sdk` (`activate`, `renew`, `deactivate`,
+/// `machines`, `rename_machine`, and, with the `cache` feature, `check`).
 #[derive(Debug, thiserror::Error)]
 pub enum LatteError {
     /// The license key's format or checksum is invalid, or its short_id
@@ -125,6 +125,19 @@ pub enum LatteError {
     LicenseNotFound,
     #[error("invalid project key")]
     InvalidProjectKey,
+    /// `deactivate` refused by the seller's deactivation policy (a 409): a
+    /// machine on this licence was released too recently, or the licence
+    /// has used its releases for the year. Nothing was released and the
+    /// cached token is kept.
+    #[error("deactivation blocked: {message}")]
+    DeactivationBlocked {
+        /// Explains the refusal and is written to be shown to the user.
+        message: String,
+        /// `"deactivation_cooldown"` or `"deactivation_limit_reached"`.
+        reason: String,
+        /// When a release becomes possible, `None` when not known.
+        available_at: Option<std::time::SystemTime>,
+    },
     #[error(transparent)]
     InvalidAppId(#[from] AppIdError),
     /// `Sdk::new` could not read this platform's machine ID and

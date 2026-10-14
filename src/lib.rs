@@ -31,7 +31,7 @@ pub mod verify;
 
 pub use entitlements::{EntitlementValue, UNLIMITED};
 #[cfg(feature = "http")]
-pub use http::{Config, Sdk};
+pub use http::{Config, DeactivateResult, Machine, Sdk};
 
 use domain::{CertChain, License};
 use error::{ValidateError, VerifyError};

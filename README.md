@@ -72,7 +72,8 @@ latte-rs = "0"
 
 Two features are on by default and independently toggleable:
 
-- `http`: network activation/renewal via `reqwest`.
+- `http`: network activation/renewal, deactivation and the machine list
+  via `reqwest`.
 - `cache`: the on-disk token cache (`Sdk::check`, and the fast path inside
   `activate`/`renew`).
 
@@ -153,6 +154,77 @@ platform's cannot be read, `Sdk::new` returns
 `Sdk::machine_id()` returns the derived value, which is what the low-level
 functions below take. Without the `http` feature, compute it with
 `latte_rs::machine_id::derive(app_id, raw)`.
+
+## Machine name
+
+`activate` can send a name for this machine, which the customer sees in
+`Sdk::machines` and the customer portal and you see in the dashboard. The
+standard library has no hostname call and this crate takes no dependency
+for one, so no name is sent unless you set it:
+
+```rust
+let sdk = Sdk::new(Config::with_app_id("pk_live_...").with_machine_name(hostname))?;
+```
+
+An empty name sends none. The name is stored only when the activation is
+created, and a name the customer sets later with `rename_machine` is kept
+on re-activation.
+
+## Releasing this machine (deactivate)
+
+```rust
+use latte_rs::error::LatteError;
+
+match sdk.deactivate(&activation_id, &key).await {
+    Ok(res) => match res.seat_free_at {
+        Some(at) => println!("released; the seat frees at {at:?}"),
+        None => println!("released; activate the licence on your other machine"),
+    },
+    Err(LatteError::DeactivationBlocked { message, .. }) => println!("{message}"),
+    Err(e) => println!("could not release, nothing was changed; try again: {e}"),
+}
+```
+
+`deactivate(activation_id, license_key)` takes the same arguments as
+`renew` and releases this machine's seat so the licence can move to
+another one: the "Deactivate" button in your application. It needs the
+network. The server releases the seat first, and only once it has
+answered with success does the SDK delete the cached token, after which
+`check` returns `LatteError::NotActivated` until the next `activate`. If
+the call fails, nothing changes locally and the user can try again; the
+seat is never lost to a dropped connection. Repeating a release that
+already went through is success, with `released` false.
+
+A machine that is lost, dead or wiped cannot call this; its seat is
+released from the seller's customer portal instead.
+
+The seller's deactivation policy may limit releases. A refusal is
+`LatteError::DeactivationBlocked { message, reason, available_at }`:
+`message` is written to be shown to the user, `reason` is
+`"deactivation_cooldown"` or `"deactivation_limit_reached"`, and
+`available_at` says when to try again. The seller may also hold the freed
+seat until this machine's last token has expired, which
+`DeactivateResult::seat_free_at` reports.
+
+## Listing and naming machines
+
+```rust
+pub async fn machines(&self, activation_id: &str, license_key: &str) -> Result<Vec<Machine>, LatteError>
+pub async fn rename_machine(&self, activation_id: &str, license_key: &str, name: &str) -> Result<String, LatteError>
+```
+
+`machines` lists the machines holding a seat on the licence: `name`
+(optional), a 12-character `fingerprint`, `activated_at`, `last_seen_at`,
+`current` for this machine, and `seat_free_at` for a released machine
+whose seat is still held. It is for showing the customer where their
+licence is in use; it cannot release another machine, which is the
+customer portal's job.
+
+`rename_machine` names this machine and returns the name as stored,
+trimmed. The server refuses a name that is empty, longer than 64
+characters or holds control characters (`LatteError::Server`). Both calls
+need the network and an active activation on this machine
+(`LatteError::LicenseExpired` otherwise, from the server's 403).
 
 ## Checking a cached activation without a network call
 

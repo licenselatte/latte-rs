@@ -19,7 +19,8 @@
 use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::VerifyingKey;
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Error as _};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::appid::parse_app_id;
 use crate::domain::CertChain;
@@ -28,9 +29,9 @@ use crate::key::{normalize_key, sanitize_key};
 use crate::machine_id;
 #[cfg(feature = "cache")]
 use crate::validate::{in_grace_period, validate_at};
-use crate::verify::master_public_keys;
 #[cfg(feature = "cache")]
 use crate::verify::verify_activation_any_at;
+use crate::verify::{master_public_keys, unix_to_system_time};
 use crate::{check_license_any_at, PublicLicense};
 #[cfg(feature = "cache")]
 use crate::{error::ValidateError, storage, CheckError};
@@ -98,6 +99,16 @@ pub struct Config {
     /// that is already activated makes that install a new machine, which
     /// takes a new seat.
     pub machine_id: Option<String>,
+    /// The name this machine is given when it activates, shown to the
+    /// customer in [`Sdk::machines`] and the customer portal and to you in
+    /// the dashboard. A name set later with [`Sdk::rename_machine`] is kept
+    /// on re-activation.
+    ///
+    /// `None` sends the default name, which is none: the standard library
+    /// has no hostname call and this crate takes no dependency for one, so
+    /// pass the hostname here if you want machines named after it.
+    /// `Some("")` sends no name either.
+    pub machine_name: Option<String>,
 }
 
 impl Config {
@@ -142,6 +153,12 @@ impl Config {
         self.machine_id = Some(machine_id.into());
         self
     }
+
+    /// Names this machine on activation. See [`Config::machine_name`].
+    pub fn with_machine_name(mut self, machine_name: impl Into<String>) -> Self {
+        self.machine_name = Some(machine_name.into());
+        self
+    }
 }
 
 /// Activates and renews licenses over the network, with an optional local
@@ -151,6 +168,7 @@ pub struct Sdk {
     base_url: String,
     app_id: String,
     machine_id: String,
+    machine_name: Option<String>,
     http: reqwest::Client,
     master_pubs: Vec<VerifyingKey>,
     #[cfg(feature = "cache")]
@@ -188,6 +206,7 @@ impl Sdk {
                 .unwrap_or_else(|| parsed.env.base_url().to_string()),
             app_id: config.app_id,
             machine_id,
+            machine_name: config.machine_name.filter(|n| !n.is_empty()),
             http,
             master_pubs: master_public_keys(),
             #[cfg(feature = "cache")]
@@ -243,6 +262,7 @@ impl Sdk {
             project_key: &self.app_id,
             license_key: &normalized,
             machine_id,
+            machine_name: self.machine_name.as_deref(),
             sdk: SDK_INFO,
         };
         let (token, chain) = self
@@ -268,20 +288,69 @@ impl Sdk {
         activation_id: &str,
         license_key: &str,
     ) -> Result<PublicLicense, LatteError> {
-        let machine_id = self.machine_id.as_str();
-        let body = RenewRequest {
-            activation_id,
-            license_key,
-            machine_id,
-            sdk: SDK_INFO,
-        };
+        let body = self.credentials(activation_id, license_key, None);
         let (token, chain) = self
             .post_and_handle_invalidation("/v1/renew", &body)
             .await?;
-        let lic = self.verify_and_validate(&token, &chain, machine_id)?;
+        let lic = self.verify_and_validate(&token, &chain, &self.machine_id)?;
         #[cfg(feature = "cache")]
         self.save_to_cache(&token, &chain);
         Ok(lic)
+    }
+
+    /// Releases this machine's seat so the licence can be activated on
+    /// another machine: the "Deactivate" button in your application. Takes
+    /// the same `activation_id` and `license_key` as [`Sdk::renew`].
+    ///
+    /// It needs the network. The server releases the seat first, and only
+    /// once it has answered does the SDK delete the cached token (with the
+    /// `cache` feature), after which `check` returns
+    /// `LatteError::NotActivated` until the next `activate`. On any error
+    /// the cached token is kept and the call can be retried. A release that
+    /// already happened is success, with `released` false. A machine that
+    /// is lost or dead cannot call this; its seat is released from the
+    /// seller's customer portal instead.
+    ///
+    /// When the seller's deactivation policy refuses the release, the error
+    /// is `LatteError::DeactivationBlocked`.
+    pub async fn deactivate(
+        &self,
+        activation_id: &str,
+        license_key: &str,
+    ) -> Result<DeactivateResult, LatteError> {
+        let body = self.credentials(activation_id, license_key, None);
+        let result = self.call("/v1/deactivate", &body).await?;
+        #[cfg(feature = "cache")]
+        self.clear_cache();
+        Ok(result)
+    }
+
+    /// Lists the machines holding a seat on this licence, for showing the
+    /// customer where it is in use. It needs the network and an active
+    /// activation on this machine (`LatteError::LicenseExpired` otherwise,
+    /// from the server's 403).
+    pub async fn machines(
+        &self,
+        activation_id: &str,
+        license_key: &str,
+    ) -> Result<Vec<Machine>, LatteError> {
+        let body = self.credentials(activation_id, license_key, None);
+        let result: MachinesResponse = self.call("/v1/machines", &body).await?;
+        Ok(result.machines)
+    }
+
+    /// Names this machine and returns the name as stored, trimmed. The
+    /// server refuses a name that is empty, longer than 64 characters or
+    /// holds control characters, which surfaces as `LatteError::Server`.
+    pub async fn rename_machine(
+        &self,
+        activation_id: &str,
+        license_key: &str,
+        name: &str,
+    ) -> Result<String, LatteError> {
+        let body = self.credentials(activation_id, license_key, Some(name));
+        let result: RenameResponse = self.call("/v1/machines/rename", &body).await?;
+        Ok(result.machine_name)
     }
 
     /// Reads the cached activation for this machine without making a
@@ -403,12 +472,49 @@ impl Sdk {
         result
     }
 
-    /// Shared POST helper for `activate`/`renew`.
+    fn credentials<'a>(
+        &'a self,
+        activation_id: &'a str,
+        license_key: &'a str,
+        machine_name: Option<&'a str>,
+    ) -> CredentialsRequest<'a> {
+        CredentialsRequest {
+            activation_id,
+            license_key,
+            machine_id: &self.machine_id,
+            machine_name,
+            sdk: SDK_INFO,
+        }
+    }
+
+    /// Token-returning POST for `activate`/`renew`.
     async fn post<B: Serialize>(
         &self,
         path: &str,
         body: &B,
     ) -> Result<(String, CertChain), LatteError> {
+        let result: TokenResponse = self.call(path, body).await?;
+
+        if result.token.is_empty() {
+            return Err(LatteError::Server("server returned empty token".into()));
+        }
+        if result.chain.daily.is_empty()
+            || result.chain.project.is_empty()
+            || result.chain.submaster.is_empty()
+        {
+            return Err(LatteError::Server("server returned empty chain".into()));
+        }
+
+        Ok((result.token, result.chain))
+    }
+
+    /// Posts `body` as JSON to `path` and decodes a 2xx answer, mapping
+    /// every other status to its `LatteError`.
+    async fn call<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, LatteError> {
         let resp = self
             .http
             .post(format!("{}{}", self.base_url, path))
@@ -423,6 +529,13 @@ impl Sdk {
             return Err(match status.as_u16() {
                 404 => LatteError::LicenseNotFound,
                 403 => LatteError::LicenseExpired,
+                // A 409 here is the seller's deactivation policy, never a
+                // seat limit.
+                409 if path == "/v1/deactivate" => LatteError::DeactivationBlocked {
+                    message: err_body.error,
+                    reason: err_body.reason,
+                    available_at: err_body.available_at,
+                },
                 409 => LatteError::SeatLimit,
                 401 => LatteError::InvalidProjectKey,
                 _ => LatteError::Server(if err_body.error.is_empty() {
@@ -433,27 +546,53 @@ impl Sdk {
             });
         }
 
-        let result: TokenResponse = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| LatteError::Server(format!("decode response: {e}")))?;
-
-        if result.token.is_empty() {
-            return Err(LatteError::Server("server returned empty token".into()));
-        }
-        if result.chain.daily.is_empty()
-            || result.chain.project.is_empty()
-            || result.chain.submaster.is_empty()
-        {
-            return Err(LatteError::Server("server returned empty chain".into()));
-        }
-
-        Ok((result.token, result.chain))
+            .map_err(|e| LatteError::Server(format!("decode response: {e}")))
     }
 }
 
-/// Which SDK made a request, sent in the body of every activate/renew so
-/// the server can tell SDK releases apart.
+/// What [`Sdk::deactivate`] reports.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct DeactivateResult {
+    /// False when the machine was already released, on an earlier call or
+    /// by the seller. Both outcomes are success.
+    pub released: bool,
+    /// When the freed seat can be used by another machine, set when the
+    /// seller's policy holds it until this machine's last token has
+    /// expired. `None` means the seat is free now.
+    #[serde(default, deserialize_with = "de_opt_time")]
+    pub seat_free_at: Option<SystemTime>,
+}
+
+/// One machine holding a seat on the licence, as [`Sdk::machines`] lists
+/// it. It identifies a machine for a person to recognise and is never a
+/// handle for acting on one.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct Machine {
+    /// The machine's name, `None` when it has none.
+    #[serde(rename = "machine_name", default)]
+    pub name: Option<String>,
+    /// The first 12 characters of the machine ID hash.
+    #[serde(rename = "machine_fingerprint")]
+    pub fingerprint: String,
+    #[serde(deserialize_with = "de_time")]
+    pub activated_at: SystemTime,
+    /// The machine's last activation or renewal.
+    #[serde(deserialize_with = "de_time")]
+    pub last_seen_at: SystemTime,
+    /// Set on a released machine whose seat the seller's policy still
+    /// holds, and is when that seat frees.
+    #[serde(default, deserialize_with = "de_opt_time")]
+    pub seat_free_at: Option<SystemTime>,
+    /// Marks the machine the SDK is running on.
+    pub current: bool,
+}
+
+/// Which SDK made a request, sent in the body of every request so the
+/// server can tell SDK releases apart.
 #[derive(Serialize, Clone, Copy)]
 struct SdkInfo {
     language: &'static str,
@@ -470,14 +609,20 @@ struct ActivateRequest<'a> {
     project_key: &'a str,
     license_key: &'a str,
     machine_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_name: Option<&'a str>,
     sdk: SdkInfo,
 }
 
+/// Renew's body, which deactivate, machines and rename share; only rename
+/// sends `machine_name`.
 #[derive(Serialize)]
-struct RenewRequest<'a> {
+struct CredentialsRequest<'a> {
     activation_id: &'a str,
     license_key: &'a str,
     machine_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_name: Option<&'a str>,
     sdk: SdkInfo,
 }
 
@@ -487,8 +632,140 @@ struct TokenResponse {
     chain: CertChain,
 }
 
+#[derive(Deserialize)]
+struct MachinesResponse {
+    machines: Vec<Machine>,
+}
+
+#[derive(Deserialize)]
+struct RenameResponse {
+    machine_name: String,
+}
+
 #[derive(Deserialize, Default)]
 struct ErrorResponse {
     #[serde(default)]
     error: String,
+    /// Set on a deactivation refused by the seller's policy.
+    #[serde(default)]
+    reason: String,
+    #[serde(default, deserialize_with = "de_opt_time")]
+    available_at: Option<SystemTime>,
+}
+
+fn de_time<'de, D: Deserializer<'de>>(d: D) -> Result<SystemTime, D::Error> {
+    let s = String::deserialize(d)?;
+    parse_rfc3339(&s).ok_or_else(|| D::Error::custom(format!("invalid timestamp {s:?}")))
+}
+
+fn de_opt_time<'de, D: Deserializer<'de>>(d: D) -> Result<Option<SystemTime>, D::Error> {
+    match Option::<String>::deserialize(d)? {
+        Some(s) => parse_rfc3339(&s)
+            .map(Some)
+            .ok_or_else(|| D::Error::custom(format!("invalid timestamp {s:?}"))),
+        None => Ok(None),
+    }
+}
+
+/// Parses the RFC 3339 timestamps the API sends
+/// (`2026-10-21T09:00:00Z`, optionally with fractional seconds or a
+/// `+hh:mm` offset).
+fn parse_rfc3339(s: &str) -> Option<SystemTime> {
+    fn digits(s: &str, r: std::ops::Range<usize>) -> Option<i64> {
+        s.get(r)
+            .filter(|d| d.bytes().all(|c| c.is_ascii_digit()))?
+            .parse()
+            .ok()
+    }
+    let num = |r| digits(s, r);
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+
+    let mut rest = &s[19..];
+    let mut nanos = 0;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let n = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if n == 0 {
+            return None;
+        }
+        nanos = format!("{:0<9}", &frac[..n.min(9)]).parse().ok()?;
+        rest = &frac[n..];
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes().first()? {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            if rest.len() != 6 || rest.as_bytes()[3] != b':' {
+                return None;
+            }
+            sign * (digits(rest, 1..3)? * 3600 + digits(rest, 4..6)? * 60)
+        }
+    };
+
+    // Days since 1970-01-01 in the proleptic Gregorian calendar (Howard
+    // Hinnant's days_from_civil).
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((mo + 9) % 12) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+
+    let secs = days * 86_400 + h * 3600 + mi * 60 + sec - offset;
+    Some(unix_to_system_time(secs) + Duration::from_nanos(nanos))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_rfc3339() {
+        let at = |secs: u64, nanos: u64| {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_nanos(nanos)
+        };
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(at(0, 0)));
+        assert_eq!(
+            parse_rfc3339("2026-10-21T09:00:00Z"),
+            Some(at(1_792_573_200, 0))
+        );
+        assert_eq!(
+            parse_rfc3339("2024-02-29T23:59:59.5Z"),
+            Some(at(1_709_251_199, 500_000_000))
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-21T11:00:00.123456789+02:00"),
+            Some(at(1_792_573_200, 123_456_789))
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-21T04:30:00-04:30"),
+            Some(at(1_792_573_200, 0))
+        );
+        for bad in [
+            "",
+            "2026-10-21",
+            "2026-10-21T09:00:00",
+            "2026-13-01T00:00:00Z",
+            "2026-10-21T09:00:00.Z",
+            "2026-10-21T09:00:00+0200",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+    }
 }

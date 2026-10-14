@@ -38,7 +38,7 @@ fn pub_key_from_cert(
     pub_key_from_bytes(&bytes)
 }
 
-fn unix_to_system_time(secs: i64) -> SystemTime {
+pub(crate) fn unix_to_system_time(secs: i64) -> SystemTime {
     if secs >= 0 {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
     } else {

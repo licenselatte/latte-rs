@@ -1,6 +1,7 @@
-//! Tests for `Sdk::activate`/`Sdk::renew`/`Sdk::check` against a mocked
+//! Tests for `Sdk::activate`/`Sdk::renew`/`Sdk::check` and the machine
+//! calls (`deactivate`/`machines`/`rename_machine`) against a mocked
 //! LicenseLatte API (`wiremock`), covering:
-//!   - the exact wire request shape for activate/renew
+//!   - the exact wire request shape for every call
 //!   - status-code -> sentinel error mapping
 //!   - transport-level failure -> `LatteError::Network`
 //!   - malformed/empty response bodies -> `LatteError::Server`
@@ -400,6 +401,240 @@ async fn activate_leaves_an_existing_cache_entry_alone_on_an_unrelated_server_er
     // went wrong; an existing cache entry (unverifiable or not) shouldn't
     // be touched over it.
     assert!(cache_path.exists());
+}
+
+// --- deactivate, machines, rename ---
+
+const TEST_ACTIVATION_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+fn credentials_body() -> serde_json::Value {
+    json!({
+        "activation_id": TEST_ACTIVATION_ID,
+        "license_key": TEST_LICENSE_KEY,
+        "machine_id": test_machine_id(),
+        "sdk": {"language": "rust", "version": env!("CARGO_PKG_VERSION")},
+    })
+}
+
+fn unix(secs: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+}
+
+#[tokio::test]
+async fn deactivate_sends_renews_credentials_and_forgets_the_token() {
+    let mock_server = MockServer::start().await;
+    let (_dir, cache_path) = temp_cache_path();
+    storage::save(&cache_path, "not-a-real-jwt", &garbage_chain()).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/v1/deactivate"))
+        .and(body_json(credentials_body()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"released": true, "seat_free_at": "2026-10-21T09:00:00Z"})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let sdk = sdk_against(&mock_server, cache_path.clone()).await;
+    let res = sdk
+        .deactivate(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
+        .await
+        .unwrap();
+    assert!(res.released);
+    assert_eq!(res.seat_free_at, Some(unix(1_792_573_200)));
+    assert!(storage::load(&cache_path).is_none());
+    let err = sdk.check().unwrap_err();
+    assert!(matches!(err, LatteError::NotActivated), "got {err:?}");
+}
+
+#[tokio::test]
+async fn deactivate_that_was_already_released_is_success_and_forgets_the_token() {
+    let mock_server = MockServer::start().await;
+    let (_dir, cache_path) = temp_cache_path();
+    storage::save(&cache_path, "not-a-real-jwt", &garbage_chain()).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/v1/deactivate"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"released": false, "seat_free_at": null})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let sdk = sdk_against(&mock_server, cache_path.clone()).await;
+    let res = sdk
+        .deactivate(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
+        .await
+        .unwrap();
+    assert!(!res.released);
+    assert_eq!(res.seat_free_at, None);
+    assert!(storage::load(&cache_path).is_none());
+}
+
+#[tokio::test]
+async fn deactivate_refused_by_policy_is_deactivation_blocked_and_keeps_the_token() {
+    let mock_server = MockServer::start().await;
+    let (_dir, cache_path) = temp_cache_path();
+    storage::save(&cache_path, "not-a-real-jwt", &garbage_chain()).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/v1/deactivate"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "error": "Wait a week.",
+            "reason": "deactivation_cooldown",
+            "available_at": "2026-10-21T09:00:00Z",
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let sdk = sdk_against(&mock_server, cache_path.clone()).await;
+    let err = sdk
+        .deactivate(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
+        .await
+        .unwrap_err();
+    match err {
+        LatteError::DeactivationBlocked {
+            message,
+            reason,
+            available_at,
+        } => {
+            assert_eq!(message, "Wait a week.");
+            assert_eq!(reason, "deactivation_cooldown");
+            assert_eq!(available_at, Some(unix(1_792_573_200)));
+        }
+        other => panic!("expected DeactivationBlocked, got {other:?}"),
+    }
+    assert!(storage::load(&cache_path).is_some());
+}
+
+#[tokio::test]
+async fn deactivate_keeps_the_token_on_statuses_that_clear_it_for_renew() {
+    for status in [403, 404, 401] {
+        let mock_server = MockServer::start().await;
+        let (_dir, cache_path) = temp_cache_path();
+        storage::save(&cache_path, "not-a-real-jwt", &garbage_chain()).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v1/deactivate"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&mock_server)
+            .await;
+
+        let sdk = sdk_against(&mock_server, cache_path.clone()).await;
+        assert!(sdk
+            .deactivate(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
+            .await
+            .is_err());
+        assert!(storage::load(&cache_path).is_some(), "status {status}");
+    }
+}
+
+#[tokio::test]
+async fn deactivate_network_failure_keeps_the_token() {
+    let (_dir, cache_path) = temp_cache_path();
+    storage::save(&cache_path, "not-a-real-jwt", &garbage_chain()).unwrap();
+    let config = Config::with_app_id(TEST_APP_ID)
+        .with_timeout(std::time::Duration::from_millis(500))
+        .with_base_url("http://127.0.0.1:1")
+        .with_cache_path(cache_path.clone())
+        .with_machine_id(TEST_RAW_MACHINE_ID);
+    let sdk = Sdk::new(config).unwrap();
+
+    let err = sdk
+        .deactivate(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LatteError::Network(_)), "got {err:?}");
+    assert!(storage::load(&cache_path).is_some());
+}
+
+#[tokio::test]
+async fn machines_parses_the_list() {
+    let mock_server = MockServer::start().await;
+    let (_dir, cache_path) = temp_cache_path();
+    Mock::given(method("POST"))
+        .and(path("/v1/machines"))
+        .and(body_json(credentials_body()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"machines": [
+            {"machine_name": "Studio", "machine_fingerprint": "9f1c4a0b2d3e", "activated_at": "2026-10-01T00:00:00Z", "last_seen_at": "2026-10-14T00:00:00Z", "current": true},
+            {"machine_fingerprint": "0a1b2c3d4e5f", "activated_at": "2026-09-01T00:00:00Z", "last_seen_at": "2026-09-02T00:00:00Z", "seat_free_at": "2026-10-20T00:00:00Z", "current": false},
+        ]})))
+        .mount(&mock_server)
+        .await;
+
+    let sdk = sdk_against(&mock_server, cache_path).await;
+    let machines = sdk
+        .machines(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
+        .await
+        .unwrap();
+    assert_eq!(machines.len(), 2);
+    assert_eq!(machines[0].name.as_deref(), Some("Studio"));
+    assert_eq!(machines[0].fingerprint, "9f1c4a0b2d3e");
+    assert_eq!(machines[0].activated_at, unix(1_790_812_800));
+    assert_eq!(machines[0].last_seen_at, unix(1_791_936_000));
+    assert_eq!(machines[0].seat_free_at, None);
+    assert!(machines[0].current);
+    assert_eq!(machines[1].name, None);
+    assert_eq!(machines[1].seat_free_at, Some(unix(1_792_454_400)));
+    assert!(!machines[1].current);
+}
+
+#[tokio::test]
+async fn rename_machine_sends_the_name_and_returns_the_stored_one() {
+    let mock_server = MockServer::start().await;
+    let (_dir, cache_path) = temp_cache_path();
+    let mut body = credentials_body();
+    body["machine_name"] = json!(" Studio Mac ");
+    Mock::given(method("POST"))
+        .and(path("/v1/machines/rename"))
+        .and(body_json(body))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"machine_name": "Studio Mac"})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let sdk = sdk_against(&mock_server, cache_path).await;
+    let name = sdk
+        .rename_machine(TEST_ACTIVATION_ID, TEST_LICENSE_KEY, " Studio Mac ")
+        .await
+        .unwrap();
+    assert_eq!(name, "Studio Mac");
+}
+
+#[tokio::test]
+async fn activate_sends_machine_name_when_configured_and_omits_it_when_empty() {
+    for (configured, sent) in [("Studio Mac", Some("Studio Mac")), ("", None)] {
+        let mock_server = MockServer::start().await;
+        let (_dir, cache_path) = temp_cache_path();
+        let mut body = json!({
+            "project_key": TEST_APP_ID,
+            "license_key": TEST_LICENSE_KEY,
+            "machine_id": test_machine_id(),
+            "sdk": {"language": "rust", "version": env!("CARGO_PKG_VERSION")},
+        });
+        if let Some(name) = sent {
+            body["machine_name"] = json!(name);
+        }
+        // Only the exact body answers 401; anything else falls through to
+        // wiremock's 404.
+        Mock::given(method("POST"))
+            .and(path("/v1/activate"))
+            .and(body_json(body))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let config = Config::with_app_id(TEST_APP_ID)
+            .with_base_url(mock_server.uri())
+            .with_cache_path(cache_path)
+            .with_machine_id(TEST_RAW_MACHINE_ID)
+            .with_machine_name(configured);
+        let sdk = Sdk::new(config).unwrap();
+        let err = sdk.activate(TEST_LICENSE_KEY).await.unwrap_err();
+        assert!(
+            matches!(err, LatteError::InvalidProjectKey),
+            "name {configured:?}: got {err:?}"
+        );
+    }
 }
 
 /// A `PartialEq`-able projection of the sentinel `LatteError` variants

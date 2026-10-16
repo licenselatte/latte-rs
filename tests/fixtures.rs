@@ -6,8 +6,9 @@
 use ed25519_dalek::VerifyingKey;
 use latte_rs::domain::CertChain;
 use latte_rs::error::ValidateError;
+use latte_rs::storage;
 use latte_rs::validate::{in_grace_period, validate_at};
-use latte_rs::verify::verify_activation_at;
+use latte_rs::verify::{verify_activation_any_at, verify_activation_at};
 use latte_rs::{check_license_at, PublicLicense, UNLIMITED};
 use serde::Deserialize;
 use std::fs;
@@ -263,4 +264,121 @@ fn assert_entitlements(lic: &PublicLicense, f: &Fixture) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn parse_keys(hexes: &[String]) -> Vec<VerifyingKey> {
+    hexes
+        .iter()
+        .map(|h| {
+            let arr: [u8; 32] = hex::decode(h).unwrap().try_into().unwrap();
+            VerifyingKey::from_bytes(&arr).unwrap()
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct AnchorCase {
+    name: String,
+    now: String,
+    master_public_keys_hex: Vec<String>,
+    machine_id: String,
+    token: String,
+    chain: ChainJson,
+    expect: String,
+    expect_stage: String,
+}
+
+#[derive(Deserialize)]
+struct Anchors {
+    cases: Vec<AnchorCase>,
+}
+
+/// testdata/anchors.json: a submaster cert signed by any one trusted root
+/// verifies, one signed by a root outside the list does not.
+#[test]
+fn anchors() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/anchors.json");
+    let a: Anchors = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert!(!a.cases.is_empty());
+
+    let mut failures = Vec::new();
+    for c in &a.cases {
+        let now = parse_rfc3339(&c.now);
+        let chain = CertChain {
+            submaster: c.chain.submaster.clone(),
+            project: c.chain.project.clone(),
+            daily: c.chain.daily.clone(),
+        };
+        let got = match verify_activation_any_at(
+            &parse_keys(&c.master_public_keys_hex),
+            &c.token,
+            &chain,
+            now,
+        ) {
+            Err(_) => ("reject", "verify"),
+            Ok(lic) => match validate_at(&lic, &c.machine_id, now) {
+                Err(_) => ("reject", "validate"),
+                Ok(()) => ("accept", "none"),
+            },
+        };
+        if got != (c.expect.as_str(), c.expect_stage.as_str()) {
+            failures.push(format!(
+                "{}: got {}/{}, want {}/{}",
+                c.name, got.0, got.1, c.expect, c.expect_stage
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "anchor failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[derive(Deserialize)]
+struct CacheCase {
+    name: String,
+    contents: String,
+}
+
+#[derive(Deserialize)]
+struct CacheFiles {
+    now: String,
+    master_public_keys_hex: Vec<String>,
+    cases: Vec<CacheCase>,
+}
+
+/// testdata/cache_files.json: a cached token file this SDK cannot use must
+/// come out as not activated, never as a panic.
+#[test]
+fn cache_files() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/cache_files.json");
+    let cf: CacheFiles = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert!(!cf.cases.is_empty());
+    let now = parse_rfc3339(&cf.now);
+    let keys = parse_keys(&cf.master_public_keys_hex);
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut failures = Vec::new();
+    for c in &cf.cases {
+        let file = dir.path().join(format!("{}.json", c.name));
+        fs::write(&file, &c.contents).unwrap();
+        let outcome = std::panic::catch_unwind(|| match storage::load(&file) {
+            None => true,
+            Some((token, chain)) => verify_activation_any_at(&keys, &token, &chain, now).is_err(),
+        });
+        match outcome {
+            Ok(true) => {}
+            Ok(false) => failures.push(format!(
+                "{}: verified a cache file with no usable chain",
+                c.name
+            )),
+            Err(_) => failures.push(format!("{}: panicked", c.name)),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "cache file failures:\n{}",
+        failures.join("\n")
+    );
 }

@@ -15,7 +15,7 @@ impl Environment {
     pub fn base_url(&self) -> &'static str {
         match self {
             Environment::Live => "https://api.licenselatte.com",
-            Environment::Test => "https://test.api.licenselatte.com",
+            Environment::Test => "https://api.licenselatte.com",
             Environment::Local => "http://localhost:8080",
         }
     }
@@ -68,6 +68,7 @@ mod tests {
         let parsed = parse_app_id(&format!("pk_live_{data}{checksum}")).unwrap();
         assert_eq!(parsed.env, Environment::Live);
         assert_eq!(parsed.env.base_url(), "https://api.licenselatte.com");
+        assert_eq!(Environment::Test.base_url(), "https://api.licenselatte.com");
     }
 
     #[test]

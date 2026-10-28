@@ -369,6 +369,7 @@ async fn a_flagged_token_is_still_rejected_past_the_grace_deadline() {
     rig.fail_to_reach_the_server().await;
     rig.advance(8 * 24 * 60 * 60);
     assert!(matches!(rig.sdk.check(), Err(LatteError::NotActivated)));
+    rig.idle().await;
 }
 
 #[tokio::test]
@@ -496,4 +497,112 @@ async fn deactivate_and_activate_reset_the_flag() {
         .await;
     rig.sdk.activate("A-DIFFERENT-KEY").await.unwrap();
     assert!(!rig.sdk.renewal().renewal_failed);
+}
+
+#[tokio::test]
+async fn a_token_past_its_grace_deadline_is_renewed_and_a_later_check_succeeds() {
+    let rig = Rig::new("expired_past_grace_deadline").await;
+    rig.reply(rig.renewed.response()).await;
+
+    assert!(matches!(rig.sdk.check(), Err(LatteError::NotActivated)));
+    rig.idle().await;
+    assert_eq!(rig.requests().await.len(), 1);
+    assert_eq!(rig.cached_token(), Some(rig.renewed.token.clone()));
+
+    let lic = rig.sdk.check().unwrap();
+    assert_eq!(lic.activation_id, ACTIVATION_ID);
+    rig.idle().await;
+    assert_eq!(rig.requests().await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_token_whose_licence_and_daily_cert_have_lapsed_is_renewed_too() {
+    let rig = Rig::new("clock_skew_after_cert_validity").await;
+    rig.reply(rig.renewed.response()).await;
+
+    assert!(matches!(rig.sdk.check(), Err(LatteError::LicenseExpired)));
+    rig.idle().await;
+    assert_eq!(rig.requests().await.len(), 1);
+    assert!(rig.sdk.check().is_ok());
+}
+
+#[tokio::test]
+async fn a_token_that_does_not_verify_or_is_for_another_machine_is_never_renewed() {
+    for cached in [
+        "tampered_payload",
+        "invalid_signature",
+        "malformed_garbage_token",
+    ] {
+        let rig = Rig::new(cached).await;
+        rig.reply(rig.renewed.response()).await;
+        rig.advance(2 * 60 * 60);
+        assert!(rig.sdk.check().is_err());
+        rig.idle().await;
+        assert!(rig.requests().await.is_empty(), "{cached}");
+    }
+
+    let mut rig = Rig::new("expired_past_grace_deadline").await;
+    rig.reply(rig.renewed.response()).await;
+    rig.sdk.machine_id = "another-machine".into();
+    assert!(rig.sdk.check().is_err());
+    rig.idle().await;
+    assert!(rig.requests().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_rejected_renewal_of_a_past_grace_token_clears_the_cache() {
+    let rig = Rig::new("expired_past_grace_deadline").await;
+    rig.reply(ResponseTemplate::new(404).set_body_json(json!({"error": "gone"})))
+        .await;
+
+    assert!(rig.sdk.check().is_err());
+    rig.idle().await;
+    assert_eq!(rig.requests().await.len(), 1);
+    assert_eq!(rig.cached_token(), None);
+}
+
+#[tokio::test]
+async fn a_failed_renewal_of_a_past_grace_token_keeps_the_cache_and_waits_five_minutes() {
+    let mut rig = Rig::new("expired_past_grace_deadline").await;
+    let before = rig.cached_token();
+    rig.sdk.base_url = "http://127.0.0.1:1".into();
+    assert!(rig.sdk.check().is_err());
+    rig.idle().await;
+    assert_eq!(rig.cached_token(), before);
+
+    let rig = Rig::new("expired_past_grace_deadline").await;
+    let before = rig.cached_token();
+    rig.reply(ResponseTemplate::new(503)).await;
+    for (advance, total) in [(0, 1), (299, 1), (1, 2)] {
+        rig.advance(advance);
+        assert!(rig.sdk.check().is_err());
+        rig.idle().await;
+        assert_eq!(rig.requests().await.len(), total, "after +{advance}s");
+    }
+    assert_eq!(rig.cached_token(), before);
+}
+
+#[tokio::test]
+async fn the_flag_follows_the_outcome_of_a_past_grace_renewal_like_any_other() {
+    for status in [200, 404, 429, 503] {
+        let mut rig = Rig::new("expired_past_grace_deadline").await;
+        let reachable = std::mem::replace(&mut rig.sdk.base_url, "http://127.0.0.1:1".into());
+        assert!(rig.sdk.check().is_err());
+        rig.idle().await;
+        assert!(rig.sdk.renewal().renewal_failed);
+        assert!(rig.cached_token().is_some());
+        rig.sdk.base_url = reachable;
+
+        let reply = match status {
+            200 => rig.renewed.response(),
+            _ => ResponseTemplate::new(status).set_body_json(json!({"error": "nope"})),
+        };
+        rig.reply(reply).await;
+        rig.advance(300);
+        assert!(rig.sdk.check().is_err());
+        rig.idle().await;
+
+        assert!(!rig.sdk.renewal().renewal_failed, "status {status}");
+        assert_eq!(rig.sdk.check().is_ok(), status == 200, "status {status}");
+    }
 }

@@ -12,10 +12,14 @@
 //!   nothing for it to check). Turn this off for embedded/sandboxed
 //!   targets with no writable filesystem.
 //!
-//! `activate`/`renew` always go over the network on a cache miss; there's
-//! no background renewal thread here; call `renew` yourself on whatever
-//! schedule fits your application.
+//! `activate`/`renew` always go over the network on a cache miss. With the
+//! `cache` feature, `check` also renews a cached token in the background
+//! once it is an hour old (see [`Sdk::check`]); `renew` stays available to
+//! renew on a schedule of your own.
 
+use std::sync::Arc;
+#[cfg(feature = "cache")]
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::VerifyingKey;
@@ -37,6 +41,14 @@ use crate::{check_license_any_at, PublicLicense};
 use crate::{error::ValidateError, storage, CheckError};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A cached token this old or older is renewed in the background.
+#[cfg(feature = "cache")]
+const RENEW_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// Background renewal attempts start at least this far apart.
+#[cfg(feature = "cache")]
+const RENEW_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// Configuration for [`Sdk::new`].
 ///
@@ -164,6 +176,10 @@ impl Config {
 /// Activates and renews licenses over the network, with an optional local
 /// cache so a valid activation survives across process restarts without a
 /// network round trip.
+///
+/// Cloning is cheap and the clone shares the renewal state and the cache
+/// with the original.
+#[derive(Clone)]
 pub struct Sdk {
     base_url: String,
     app_id: String,
@@ -173,6 +189,31 @@ pub struct Sdk {
     master_pubs: Vec<VerifyingKey>,
     #[cfg(feature = "cache")]
     cache_path: Option<std::path::PathBuf>,
+    clock: Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    /// Background-renewal bookkeeping, and the lock every cache write that
+    /// has to be conditional on what the cache holds goes through.
+    #[cfg(feature = "cache")]
+    renewal: Arc<Mutex<Renewal>>,
+}
+
+#[cfg(feature = "cache")]
+#[derive(Default)]
+struct Renewal {
+    in_flight: bool,
+    /// When the last renewal attempt, background or manual, started.
+    last_attempt: Option<SystemTime>,
+}
+
+/// Marks the background renewal finished when dropped, even on a panic, so
+/// one that dies cannot stop every later one from starting.
+#[cfg(feature = "cache")]
+struct InFlight<'a>(&'a Sdk);
+
+#[cfg(feature = "cache")]
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.renewal().in_flight = false;
+    }
 }
 
 impl Sdk {
@@ -211,6 +252,9 @@ impl Sdk {
             master_pubs: master_public_keys(),
             #[cfg(feature = "cache")]
             cache_path,
+            clock: Arc::new(SystemTime::now),
+            #[cfg(feature = "cache")]
+            renewal: Arc::default(),
         })
     }
 
@@ -283,11 +327,19 @@ impl Sdk {
     /// the wire request here carries no project-key field. On success, and
     /// with the `cache` feature enabled, the renewed token replaces
     /// whatever was previously cached.
+    ///
+    /// With the `cache` feature, a call counts as a renewal attempt for the
+    /// background renewal in [`Sdk::check`], which waits five minutes after
+    /// it before trying again.
     pub async fn renew(
         &self,
         activation_id: &str,
         license_key: &str,
     ) -> Result<PublicLicense, LatteError> {
+        #[cfg(feature = "cache")]
+        {
+            self.renewal().last_attempt = Some((self.clock)());
+        }
         let body = self.credentials(activation_id, license_key, None);
         let (token, chain) = self
             .post_and_handle_invalidation("/v1/renew", &body)
@@ -365,6 +417,19 @@ impl Sdk {
     /// window, too old, or for a different machine ID); those don't get
     /// their own sentinel because the caller's correct response to all of
     /// them is the same: activate again.
+    ///
+    /// The verdict comes from the cached token alone and `check` returns
+    /// at once. When that token is at least 60 minutes old, `check` also
+    /// starts a renewal on a background thread, unless one is already
+    /// running or the last attempt (this one or a manual [`Sdk::renew`])
+    /// began less than five minutes ago. The thread is detached, so it
+    /// never keeps the process alive. A renewal the server rejects as
+    /// not-found, expired or for the wrong project key clears the cache,
+    /// provided it still holds the activation that was renewed, so the
+    /// next `check` returns `LatteError::NotActivated`. A renewal that
+    /// succeeds replaces the cached token under the same condition. Every
+    /// other failure is dropped: the cached token stays usable until its
+    /// grace window ends, and a later `check` tries again.
     #[cfg(feature = "cache")]
     pub fn check(&self) -> Result<PublicLicense, LatteError> {
         let Some(path) = &self.cache_path else {
@@ -379,9 +444,12 @@ impl Sdk {
             &token,
             &chain,
             &self.machine_id,
-            SystemTime::now(),
+            (self.clock)(),
         ) {
-            Ok(lic) => Ok(lic),
+            Ok(lic) => {
+                self.renew_in_background(&lic);
+                Ok(lic)
+            }
             Err(CheckError::Validate(ValidateError::HardExpired)) => {
                 Err(LatteError::LicenseExpired)
             }
@@ -408,7 +476,7 @@ impl Sdk {
     #[cfg(feature = "cache")]
     fn cached_license(&self, machine_id: &str) -> Option<(PublicLicense, String)> {
         let (token, chain) = storage::load(self.cache_path.as_deref()?)?;
-        let now = SystemTime::now();
+        let now = (self.clock)();
         let license = verify_activation_any_at(&self.master_pubs, &token, &chain, now).ok()?;
         validate_at(&license, machine_id, now).ok()?;
         let in_grace = in_grace_period(&license, now);
@@ -417,7 +485,96 @@ impl Sdk {
     }
 
     #[cfg(feature = "cache")]
+    fn renewal(&self) -> MutexGuard<'_, Renewal> {
+        self.renewal.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Starts a background renewal of `lic` if it is due: the token is at
+    /// least [`RENEW_AFTER`] old, none is running, and the last attempt
+    /// began at least [`RENEW_RETRY`] ago. Never blocks.
+    #[cfg(feature = "cache")]
+    fn renew_in_background(&self, lic: &PublicLicense) {
+        let now = (self.clock)();
+        let age = now.duration_since(lic.issued_at).unwrap_or(Duration::ZERO);
+        {
+            let mut state = self.renewal();
+            let retried_recently = state
+                .last_attempt
+                .is_some_and(|t| now.duration_since(t).unwrap_or(Duration::ZERO) < RENEW_RETRY);
+            if age < RENEW_AFTER || state.in_flight || retried_recently {
+                return;
+            }
+            state.in_flight = true;
+            state.last_attempt = Some(now);
+        }
+
+        let sdk = self.clone();
+        let (activation_id, license_key) = (lic.activation_id.clone(), lic.key.clone());
+        let spawned = std::thread::Builder::new()
+            .name("latte-renew".into())
+            .spawn(move || sdk.renew_and_store(&activation_id, &license_key));
+        if spawned.is_err() {
+            self.renewal().in_flight = false;
+        }
+    }
+
+    /// One background renewal, run on its own thread with a throwaway
+    /// current-thread runtime so `check` stays synchronous and works
+    /// outside any async runtime.
+    #[cfg(feature = "cache")]
+    fn renew_and_store(&self, activation_id: &str, license_key: &str) {
+        let _done = InFlight(self);
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let body = self.credentials(activation_id, license_key, None);
+        match runtime.block_on(self.post("/v1/renew", &body)) {
+            Ok((token, chain)) => {
+                if self
+                    .verify_and_validate(&token, &chain, &self.machine_id)
+                    .is_ok()
+                {
+                    let _cache = self.renewal();
+                    if let (true, Some(path)) =
+                        (self.holds_activation(activation_id), &self.cache_path)
+                    {
+                        let _ = storage::save(path, &token, &chain);
+                    }
+                }
+            }
+            Err(
+                LatteError::LicenseNotFound
+                | LatteError::LicenseExpired
+                | LatteError::InvalidProjectKey,
+            ) => {
+                let _cache = self.renewal();
+                if let (true, Some(path)) = (self.holds_activation(activation_id), &self.cache_path)
+                {
+                    let _ = storage::clear(path);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Whether the cache holds a verifiable token for `activation_id`.
+    /// Callers hold the [`Sdk::renewal`] lock across this and the write it
+    /// guards, so a deactivation or re-activation cannot slip in between.
+    #[cfg(feature = "cache")]
+    fn holds_activation(&self, activation_id: &str) -> bool {
+        let Some((token, chain)) = self.cache_path.as_deref().and_then(storage::load) else {
+            return false;
+        };
+        verify_activation_any_at(&self.master_pubs, &token, &chain, (self.clock)())
+            .is_ok_and(|l| l.activation_id == activation_id)
+    }
+
+    #[cfg(feature = "cache")]
     fn save_to_cache(&self, token: &str, chain: &CertChain) {
+        let _cache = self.renewal();
         if let Some(path) = &self.cache_path {
             // Best-effort: a local write failure shouldn't turn a
             // successful network activation into an error.
@@ -427,6 +584,7 @@ impl Sdk {
 
     #[cfg(feature = "cache")]
     fn clear_cache(&self) {
+        let _cache = self.renewal();
         if let Some(path) = &self.cache_path {
             let _ = storage::clear(path);
         }
@@ -438,14 +596,8 @@ impl Sdk {
         chain: &CertChain,
         machine_id: &str,
     ) -> Result<PublicLicense, LatteError> {
-        check_license_any_at(
-            &self.master_pubs,
-            token,
-            chain,
-            machine_id,
-            SystemTime::now(),
-        )
-        .map_err(|e| LatteError::Server(format!("server returned invalid token: {e}")))
+        check_license_any_at(&self.master_pubs, token, chain, machine_id, (self.clock)())
+            .map_err(|e| LatteError::Server(format!("server returned invalid token: {e}")))
     }
 
     /// Calls `post`, and on a response that unambiguously means "this
@@ -730,6 +882,9 @@ fn parse_rfc3339(s: &str) -> Option<SystemTime> {
     let secs = days * 86_400 + h * 3600 + mi * 60 + sec - offset;
     Some(unix_to_system_time(secs) + Duration::from_nanos(nanos))
 }
+
+#[cfg(all(test, feature = "cache"))]
+mod renewal_tests;
 
 #[cfg(test)]
 mod tests {

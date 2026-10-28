@@ -19,14 +19,16 @@ hex = "0.4"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 dirs = { version = "5", optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time"], optional = true }
 
 [features]
 default = ["http", "cache"]
-# Network activation/renewal (Sdk::activate/Sdk::renew). Disable with
+# Network activation/renewal (Sdk::activate/Sdk::renew). The tokio runtime
+# runs the renewal Sdk::check starts in the background. Disable with
 # `default-features = false` if you want to wire verify_activation_at/
 # validate_at up to your own HTTP client instead; those functions never
 # require this feature.
-http = ["dep:reqwest"]
+http = ["dep:reqwest", "dep:tokio"]
 # On-disk token caching, wired into Sdk::activate/Sdk::renew/Sdk::check.
 # Disable for embedded/sandboxed targets with no writable filesystem; the
 # rest of the crate (including the http feature) works fine without it,

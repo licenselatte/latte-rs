@@ -118,8 +118,9 @@ async fn main() {
 With the `cache` feature (on by default), a successful `activate`/`renew`
 is written to disk, and a later `activate` call for the same key returns
 the cached result without a network round trip as long as it's still
-valid. There's no background renewal thread; call `renew` yourself on
-whatever schedule fits your application.
+valid. `check` also keeps the cached token fresh in the background (see
+below); you can still call `renew` yourself on whatever schedule fits your
+application.
 
 ## Machine ID
 
@@ -327,6 +328,31 @@ normalization and checksum validation as every other LicenseLatte SDK
 4-character trailing checksum). This is a typo-catcher for end users pasting
 keys, not a security boundary.
 
+## Background renewal
+
+`check` answers from the cached token alone and returns immediately. When
+that token is at least 60 minutes old, `check` also starts a renewal on a
+detached background thread, so the cached token stays fresh while the app
+is online. It starts one only if none is running and the last attempt,
+background or a manual `renew`, began at least five minutes ago, so a host
+that calls `check` often still sends at most one request per five minutes.
+Nothing in `check` waits for it, and the thread never keeps your process
+from exiting.
+
+- A renewal that succeeds replaces the cached token.
+- A renewal the server rejects as not found, expired or for the wrong
+  project key clears the cache, so the next `check` returns
+  `LatteError::NotActivated`. Deactivating a licence in the dashboard
+  therefore takes effect at the next renewal attempt, not instantly.
+- Every other failure (no network, a timeout, a 5xx or 429, a response that
+  does not verify) is dropped. The cached token stays valid until its
+  grace period ends, and a later `check` tries again.
+
+The thread builds its own small `tokio` runtime, so `check` stays a
+plain synchronous call that works with or without an async runtime of
+your own. The crate depends on `tokio`'s `rt`, `net` and `time` features
+for this; `reqwest` already pulls the same crate in.
+
 ## The cache file
 
 With the `cache` feature, `Sdk` stores an activated license as a small JSON
@@ -427,9 +453,9 @@ it server-side.
 
 ## What this crate does *not* do
 
-Background renewal scheduling is intentionally out of scope. There's no
-scheduler here; `Sdk::renew` is the building block; call it on a timer, in
-response to a UI action, or whatever fits your application.
+There's no scheduler beyond the background renewal `check` starts.
+`Sdk::renew` is the building block for anything more: call it on a timer,
+in response to a UI action, or whatever fits your application.
 
 ## Testing
 

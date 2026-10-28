@@ -73,7 +73,8 @@ latte-rs = "0"
 Two features are on by default and independently toggleable:
 
 - `http`: network activation/renewal, deactivation and the machine list
-  via `reqwest`.
+  via [`ureq`](https://docs.rs/ureq), a blocking HTTP client (rustls TLS).
+  No async runtime is pulled in.
 - `cache`: the on-disk token cache (`Sdk::check`, and the fast path inside
   `activate`/`renew`).
 
@@ -94,14 +95,13 @@ environment where writing a cache file isn't possible.
 ```rust
 use latte_rs::{Config, Sdk};
 
-#[tokio::main]
-async fn main() {
-    // from the LicenseLatte dashboard; other fields default to a 30s
+fn main() {
+    // from the LicenseLatte dashboard; other fields default to a 10s
     // timeout, app_id's environment base URL, and a per-project cache path
     let sdk = Sdk::new(Config::with_app_id("pk_live_..."))
         .expect("invalid app_id");
 
-    match sdk.activate("USER-PROVIDED-LICENSE-KEY").await {
+    match sdk.activate("USER-PROVIDED-LICENSE-KEY") {
         Ok(lic) => {
             println!("license OK, expires {:?}", lic.expires_at);
             if lic.in_grace_period {
@@ -121,6 +121,77 @@ the cached result without a network round trip as long as it's still
 valid. `check` also keeps the cached token fresh in the background (see
 below); you can still call `renew` yourself on whatever schedule fits your
 application.
+
+## Blocking calls and threads
+
+`activate`, `renew`, `deactivate`, `machines` and `rename_machine` are plain
+blocking functions: each returns once the server has answered or the call
+has timed out. Call them from a worker thread, never from a GUI main
+thread, where a slow network would freeze the window. Inside an async
+executor, run them through its blocking-task API so they do not stall the
+executor's threads:
+
+```rust
+let sdk = sdk.clone(); // cheap; the clone shares the cache and renewal state
+let lic = tokio::task::spawn_blocking(move || sdk.activate(&key)).await??;
+```
+
+`check` makes no network call and takes no lock it would wait for, so it is
+safe to call from anywhere, including a GUI thread or an async task.
+
+## Timeouts
+
+| | Resolve host | Connect | Overall |
+|---|---|---|---|
+| `activate`, `renew`, `deactivate`, `machines`, `rename_machine` | 5s | 5s | 10s, or `Config::with_timeout` |
+| The background renewal `check` starts | 5s | 5s | 10s, fixed |
+
+The overall limit covers everything from resolving the host to reading the
+response, and the resolve and connect limits apply within it. Each request
+also runs on a helper thread that is abandoned one second after the
+overall limit, so a call returns `LatteError::Network` by then even when
+something no client timeout covers hangs, such as a DNS lookup that never
+returns. An abandoned helper thread holds nothing but its request, ends
+when the request does or with the process, and changes nothing.
+
+## Proxies
+
+There is no proxy setting on `Config`. The HTTP client, `ureq` 3.5, reads
+the proxy from the environment when `Sdk::new` runs: the first of
+`ALL_PROXY`, `HTTPS_PROXY` and `HTTP_PROXY` (each also in lower case) that
+holds a valid proxy URL, used for every request, and `NO_PROXY` for hosts
+to reach directly. To use a proxy, set one of them, for example
+`HTTPS_PROXY=http://user:password@proxy.example.com:8080`, before creating
+the `Sdk`. HTTP proxies (`CONNECT` for HTTPS) are supported. SOCKS proxies
+are not, because this crate does not enable `ureq`'s `socks-proxy`
+feature, and the operating system's proxy settings (macOS System Settings,
+the Windows registry) are not read. `Config::with_base_url` remains the way
+to route through a relay of your own.
+
+## Migrating from 0.5 to 0.6
+
+0.6 drops `reqwest`, `tokio` and `hyper` for the blocking `ureq` client;
+the dependency tree with all features goes from 139 crates to 59.
+
+- `activate`, `renew`, `deactivate`, `machines` and `rename_machine` are no
+  longer `async`. Drop the `.await`; names, arguments and return types
+  are unchanged, and each outcome maps to the same `LatteError` variant as
+  before. Only the wording the HTTP client puts into `Network` messages,
+  and into `Server` messages for an undecodable response, differs. From
+  async code, wrap them in `spawn_blocking` (see above).
+- The default timeout is 10s overall, down from 30s, with 5s each to
+  resolve the host and to connect. `Config::with_timeout` still sets the
+  overall limit.
+- `Sdk::new` no longer builds a client that could fail, so it never
+  returns `LatteError::Network`.
+- Proxy variables are still honoured, in a different order. 0.5 sent an
+  HTTPS request through `HTTPS_PROXY`, else `ALL_PROXY`, and ignored
+  `HTTP_PROXY` for it. 0.6 tries `ALL_PROXY`, then `HTTPS_PROXY`, then
+  `HTTP_PROXY` for every request, so `ALL_PROXY` now wins over
+  `HTTPS_PROXY`, and a machine with only `HTTP_PROXY` set now sends HTTPS
+  requests through that proxy too.
+- The crate no longer depends on `tokio`. If your code used it only
+  because this crate did, add it yourself.
 
 ## Machine ID
 
@@ -176,7 +247,7 @@ on re-activation.
 ```rust
 use latte_rs::error::LatteError;
 
-match sdk.deactivate(&activation_id, &key).await {
+match sdk.deactivate(&activation_id, &key) {
     Ok(res) => match res.seat_free_at {
         Some(at) => println!("released; the seat frees at {at:?}"),
         None => println!("released; activate the licence on your other machine"),
@@ -210,8 +281,8 @@ seat until this machine's last token has expired, which
 ## Listing and naming machines
 
 ```rust
-pub async fn machines(&self, activation_id: &str, license_key: &str) -> Result<Vec<Machine>, LatteError>
-pub async fn rename_machine(&self, activation_id: &str, license_key: &str, name: &str) -> Result<String, LatteError>
+pub fn machines(&self, activation_id: &str, license_key: &str) -> Result<Vec<Machine>, LatteError>
+pub fn rename_machine(&self, activation_id: &str, license_key: &str, name: &str) -> Result<String, LatteError>
 ```
 
 `machines` lists the machines holding a seat on the licence: `name`
@@ -373,7 +444,11 @@ is online. It starts one only if none is running and the last attempt,
 background or a manual `renew`, began at least five minutes ago, so a host
 that calls `check` often still sends at most one request per five minutes.
 Nothing in `check` waits for it, and the thread never keeps your process
-from exiting.
+from exiting. If another thread is updating the renewal state at the
+moment `check` looks, `check` starts nothing rather than wait, and a later
+`check` tries again; its verdict is the same either way. A renewal still
+running after ten minutes is taken to be stuck: the next `check` starts a
+new one, and whatever the stuck one returns later is dropped.
 
 - A renewal that succeeds replaces the cached token and clears
   `in_grace_period`.
@@ -397,10 +472,9 @@ returns the licence. Hosts should re-check rather than send the user to
 activate again. A token that fails verification or belongs to another
 machine starts no request.
 
-The thread builds its own small `tokio` runtime, so `check` stays a
-plain synchronous call that works with or without an async runtime of
-your own. The crate depends on `tokio`'s `rt`, `net` and `time` features
-for this; `reqwest` already pulls the same crate in.
+The thread makes the same blocking request as `renew`, with fixed limits
+of 5s to connect and 10s overall (see [Timeouts](#timeouts)), so no async
+runtime is involved.
 
 ## The cache file
 

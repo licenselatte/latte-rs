@@ -22,8 +22,9 @@
 //! over the network. A corrupted or unreadable file is never a hard error.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -95,10 +96,24 @@ pub fn save(path: &Path, token: &str, chain: &CertChain) -> io::Result<()> {
     let data =
         serde_json::to_vec(&record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, data)?;
-    fs::rename(&tmp_path, path)?;
-    Ok(())
+    // A name unique to this call keeps overlapping saves (threads, or
+    // processes sharing the cache path) from writing into the same file.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp_path = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .and_then(|mut file| file.write_all(&data))
+        .and_then(|()| fs::rename(&tmp_path, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    written
 }
 
 /// Deletes the cache file at `path`, if it exists. Used to drop a token the
@@ -190,7 +205,57 @@ mod tests {
 
         let (token, _) = load(&path).unwrap();
         assert_eq!(token, "second");
-        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn overlapping_saves_never_leave_a_corrupt_cache_or_temp_files() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const ROUNDS: usize = 100;
+        const BIG: usize = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        let barrier = Arc::new(Barrier::new(4));
+
+        // Threads record failures instead of panicking so that one failure
+        // cannot leave the others blocked on the barrier.
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                let token = "x".repeat(if i % 2 == 0 { BIG } else { 1 });
+                thread::spawn(move || {
+                    let mut failures = Vec::new();
+                    for _ in 0..ROUNDS {
+                        barrier.wait();
+                        if let Err(e) = save(&path, &token, &test_chain()) {
+                            failures.push(format!("save failed: {e}"));
+                        }
+                        barrier.wait();
+                        match load(&path) {
+                            Some((t, _)) if t.len() == 1 || t.len() == BIG => {}
+                            _ => failures.push("cache is not one of the saved records".into()),
+                        }
+                    }
+                    failures
+                })
+            })
+            .collect();
+        let mut failures: Vec<String> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect();
+        failures.sort();
+        failures.dedup();
+        assert!(failures.is_empty(), "{failures:?}");
+
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| name != "token.json")
+            .collect();
+        assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
     }
 
     #[test]

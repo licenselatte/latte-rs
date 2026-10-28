@@ -55,13 +55,21 @@ pub fn validate_at(
     Ok(())
 }
 
-/// `in_grace_period`: true once more than 60 minutes have passed since
-/// `issued_at` without a renewal, while still inside the grace window
-/// measured from that same `issued_at`. This is **not** "is the license in
-/// its grace period"; despite the name, it's a softer, earlier warning
-/// signal, distinct from the hard grace-deadline check in `validate_at`.
-pub fn in_grace_period(license: &License, now: SystemTime) -> bool {
+/// `in_grace_period`: true when the licence is still valid on cached data,
+/// the SDK has tried to renew it and could not reach the server, and the
+/// offline grace window has not run out. That is `renewal_failed` while
+/// more than 60 minutes and less than `grace_period` have passed since
+/// `issued_at`.
+///
+/// `renewal_failed` is the caller's record that its last renewal attempt
+/// failed to reach the server; without it an old token is not in grace
+/// however old it is. This is advisory, distinct from the hard
+/// grace-deadline check in `validate_at`.
+pub fn in_grace_period(license: &License, now: SystemTime, renewal_failed: bool) -> bool {
     const MAX_RENEWAL_TIME: Duration = Duration::from_secs(60 * 60);
+    if !renewal_failed {
+        return false;
+    }
     let since_activation = match now.duration_since(license.issued_at) {
         Ok(d) => d,
         Err(_) => return false, // now is before issued_at
@@ -177,20 +185,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn in_grace_period_is_false_before_the_60_minute_marker() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
+    fn aged(now: SystemTime, age: Duration) -> License {
         let mut lic = base_license(now);
-        lic.issued_at = now - Duration::from_secs(30 * 60);
-        assert!(!in_grace_period(&lic, now));
+        lic.issued_at = now - age;
+        lic
     }
 
     #[test]
-    fn in_grace_period_is_true_between_60_minutes_and_the_grace_deadline() {
+    fn in_grace_period_is_false_before_the_60_minute_marker() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
-        let mut lic = base_license(now);
-        lic.issued_at = now - Duration::from_secs(2 * 60 * 60);
-        assert!(in_grace_period(&lic, now));
+        let lic = aged(now, Duration::from_secs(30 * 60));
+        assert!(!in_grace_period(&lic, now, true));
+    }
+
+    #[test]
+    fn in_grace_period_is_true_after_a_failed_renewal_between_60_minutes_and_the_grace_deadline() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
+        let lic = aged(now, Duration::from_secs(2 * 60 * 60));
+        assert!(in_grace_period(&lic, now, true));
+    }
+
+    #[test]
+    fn in_grace_period_is_false_without_a_failed_renewal() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
+        let lic = aged(now, Duration::from_secs(2 * 60 * 60));
+        assert!(!in_grace_period(&lic, now, false));
+    }
+
+    #[test]
+    fn in_grace_period_boundaries_are_exclusive_even_after_a_failed_renewal() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
+        let lic = aged(now, Duration::from_secs(60 * 60));
+        assert!(!in_grace_period(&lic, now, true));
+        let lic = aged(now, Duration::from_secs(60 * 60 + 1));
+        assert!(in_grace_period(&lic, now, true));
+        let lic = base_license(now);
+        assert!(!in_grace_period(&lic, now, true), "age == grace_period");
     }
 
     #[test]

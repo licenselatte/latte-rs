@@ -58,7 +58,7 @@ fn temp_cache_path() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-async fn sdk_against(mock_server: &MockServer, cache_path: std::path::PathBuf) -> Sdk {
+fn sdk_against(mock_server: &MockServer, cache_path: std::path::PathBuf) -> Sdk {
     let config = Config::with_app_id(TEST_APP_ID)
         .with_base_url(mock_server.uri())
         .with_cache_path(cache_path)
@@ -86,11 +86,11 @@ async fn activate_sends_the_documented_request_shape() {
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path).await;
+    let sdk = sdk_against(&mock_server, cache_path);
     // The mock only matches the exact expected body; a mismatch would 404
     // and surface as LicenseNotFound instead of the Server error we expect
     // from the deliberately-bogus token below.
-    let err = sdk.activate(TEST_LICENSE_KEY).await.unwrap_err();
+    let err = sdk.activate(TEST_LICENSE_KEY).unwrap_err();
     assert!(matches!(err, LatteError::Server(_)), "got {err:?}");
 }
 
@@ -115,11 +115,8 @@ async fn renew_sends_the_documented_request_shape_without_project_key() {
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path).await;
-    let err = sdk
-        .renew(activation_id, TEST_LICENSE_KEY)
-        .await
-        .unwrap_err();
+    let sdk = sdk_against(&mock_server, cache_path);
+    let err = sdk.renew(activation_id, TEST_LICENSE_KEY).unwrap_err();
     assert!(matches!(err, LatteError::Server(_)), "got {err:?}");
 }
 
@@ -137,8 +134,8 @@ async fn server_returned_token_that_fails_verification_is_a_server_error_not_a_p
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path).await;
-    let err = sdk.activate(TEST_LICENSE_KEY).await.unwrap_err();
+    let sdk = sdk_against(&mock_server, cache_path);
+    let err = sdk.activate(TEST_LICENSE_KEY).unwrap_err();
     match err {
         LatteError::Server(msg) => assert!(msg.starts_with("server returned invalid token:")),
         other => panic!("expected Server error, got {other:?}"),
@@ -163,8 +160,8 @@ async fn status_codes_map_to_the_documented_sentinels() {
             .mount(&mock_server)
             .await;
 
-        let sdk = sdk_against(&mock_server, cache_path).await;
-        let err = sdk.activate(TEST_LICENSE_KEY).await.unwrap_err();
+        let sdk = sdk_against(&mock_server, cache_path);
+        let err = sdk.activate(TEST_LICENSE_KEY).unwrap_err();
         assert_eq!(LatteErrorKind::from(&err), expected, "status {status}");
     }
 }
@@ -179,8 +176,8 @@ async fn unmapped_status_code_is_a_server_error_with_the_server_message() {
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path).await;
-    let err = sdk.activate(TEST_LICENSE_KEY).await.unwrap_err();
+    let sdk = sdk_against(&mock_server, cache_path);
+    let err = sdk.activate(TEST_LICENSE_KEY).unwrap_err();
     match err {
         LatteError::Server(msg) => assert_eq!(msg, "something broke"),
         other => panic!("expected Server error, got {other:?}"),
@@ -201,16 +198,16 @@ async fn empty_token_in_a_200_response_is_a_server_error() {
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path).await;
-    let err = sdk.activate(TEST_LICENSE_KEY).await.unwrap_err();
+    let sdk = sdk_against(&mock_server, cache_path);
+    let err = sdk.activate(TEST_LICENSE_KEY).unwrap_err();
     match err {
         LatteError::Server(msg) => assert_eq!(msg, "server returned empty token"),
         other => panic!("expected Server error, got {other:?}"),
     }
 }
 
-#[tokio::test]
-async fn transport_failure_is_a_network_error() {
+#[test]
+fn transport_failure_is_a_network_error() {
     // Nothing is listening on this port (a closed/unbound loopback port),
     // so the connection itself fails before any HTTP response exists.
     let (_dir, cache_path) = temp_cache_path();
@@ -221,8 +218,26 @@ async fn transport_failure_is_a_network_error() {
         .with_machine_id(TEST_RAW_MACHINE_ID);
     let sdk = Sdk::new(config).unwrap();
 
-    let err = sdk.activate(TEST_LICENSE_KEY).await.unwrap_err();
+    let err = sdk.activate(TEST_LICENSE_KEY).unwrap_err();
     assert!(matches!(err, LatteError::Network(_)), "got {err:?}");
+}
+
+#[test]
+fn a_server_that_never_answers_is_a_network_error_once_the_timeout_passes() {
+    // Bound but never accepted: the connection opens and no reply comes.
+    let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let (_dir, cache_path) = temp_cache_path();
+    let config = Config::with_app_id(TEST_APP_ID)
+        .with_timeout(std::time::Duration::from_millis(300))
+        .with_base_url(format!("http://{}", stalled.local_addr().unwrap()))
+        .with_cache_path(cache_path)
+        .with_machine_id(TEST_RAW_MACHINE_ID);
+    let sdk = Sdk::new(config).unwrap();
+
+    let started = std::time::Instant::now();
+    let err = sdk.activate(TEST_LICENSE_KEY).unwrap_err();
+    assert!(matches!(err, LatteError::Network(_)), "got {err:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
 }
 
 #[tokio::test]
@@ -233,9 +248,9 @@ async fn empty_license_key_never_reaches_the_network() {
     // fail either way a bug could manifest.
     let mock_server = MockServer::start().await;
     let (_dir, cache_path) = temp_cache_path();
-    let sdk = sdk_against(&mock_server, cache_path).await;
+    let sdk = sdk_against(&mock_server, cache_path);
 
-    let err = sdk.activate("").await.unwrap_err();
+    let err = sdk.activate("").unwrap_err();
     assert!(matches!(err, LatteError::InvalidKey), "got {err:?}");
 }
 
@@ -264,8 +279,8 @@ async fn non_native_format_key_reaches_the_network_instead_of_being_rejected_loc
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path).await;
-    let err = sdk.activate("acme-legacy-2019-key").await.unwrap_err();
+    let sdk = sdk_against(&mock_server, cache_path);
+    let err = sdk.activate("acme-legacy-2019-key").unwrap_err();
     assert!(matches!(err, LatteError::Server(_)), "got {err:?}");
 }
 
@@ -279,8 +294,8 @@ fn garbage_chain() -> latte_rs::domain::CertChain {
     }
 }
 
-#[tokio::test]
-async fn check_reports_not_activated_when_nothing_is_cached() {
+#[test]
+fn check_reports_not_activated_when_nothing_is_cached() {
     let (_dir, cache_path) = temp_cache_path();
     let config = Config::with_app_id(TEST_APP_ID)
         .with_cache_path(cache_path)
@@ -291,8 +306,8 @@ async fn check_reports_not_activated_when_nothing_is_cached() {
     assert!(matches!(err, LatteError::NotActivated), "got {err:?}");
 }
 
-#[tokio::test]
-async fn check_reports_not_activated_for_a_cache_that_fails_verification() {
+#[test]
+fn check_reports_not_activated_for_a_cache_that_fails_verification() {
     let (_dir, cache_path) = temp_cache_path();
     storage::save(&cache_path, "not-a-real-jwt", &garbage_chain()).unwrap();
 
@@ -317,11 +332,11 @@ async fn activate_falls_through_to_the_network_when_the_cache_is_unverifiable() 
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path).await;
+    let sdk = sdk_against(&mock_server, cache_path);
     // LicenseNotFound only happens on the network path; reaching it proves
     // the unverifiable cache entry didn't short-circuit into a false
     // "success" or a cache-specific error.
-    let err = sdk.activate(TEST_LICENSE_KEY).await.unwrap_err();
+    let err = sdk.activate(TEST_LICENSE_KEY).unwrap_err();
     assert!(matches!(err, LatteError::LicenseNotFound), "got {err:?}");
 }
 
@@ -339,8 +354,8 @@ async fn activate_does_not_cache_a_server_response_that_fails_verification() {
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path.clone()).await;
-    let _ = sdk.activate(TEST_LICENSE_KEY).await;
+    let sdk = sdk_against(&mock_server, cache_path.clone());
+    let _ = sdk.activate(TEST_LICENSE_KEY);
 
     assert!(storage::load(&cache_path).is_none());
 }
@@ -357,8 +372,8 @@ async fn activate_clears_an_existing_cache_entry_on_license_not_found() {
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path.clone()).await;
-    let _ = sdk.activate(TEST_LICENSE_KEY).await;
+    let sdk = sdk_against(&mock_server, cache_path.clone());
+    let _ = sdk.activate(TEST_LICENSE_KEY);
 
     assert!(storage::load(&cache_path).is_none());
 }
@@ -375,9 +390,9 @@ async fn renew_clears_an_existing_cache_entry_on_license_expired() {
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path.clone()).await;
+    let sdk = sdk_against(&mock_server, cache_path.clone());
     let activation_id = "11111111-1111-1111-1111-111111111111";
-    let _ = sdk.renew(activation_id, TEST_LICENSE_KEY).await;
+    let _ = sdk.renew(activation_id, TEST_LICENSE_KEY);
 
     assert!(storage::load(&cache_path).is_none());
 }
@@ -394,8 +409,8 @@ async fn activate_leaves_an_existing_cache_entry_alone_on_an_unrelated_server_er
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path.clone()).await;
-    let _ = sdk.activate(TEST_LICENSE_KEY).await;
+    let sdk = sdk_against(&mock_server, cache_path.clone());
+    let _ = sdk.activate(TEST_LICENSE_KEY);
 
     // A 500 doesn't mean the activation is gone, just that something else
     // went wrong; an existing cache entry (unverifiable or not) shouldn't
@@ -435,10 +450,9 @@ async fn deactivate_sends_renews_credentials_and_forgets_the_token() {
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path.clone()).await;
+    let sdk = sdk_against(&mock_server, cache_path.clone());
     let res = sdk
         .deactivate(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
-        .await
         .unwrap();
     assert!(res.released);
     assert_eq!(res.seat_free_at, Some(unix(1_792_573_200)));
@@ -461,10 +475,9 @@ async fn deactivate_that_was_already_released_is_success_and_forgets_the_token()
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path.clone()).await;
+    let sdk = sdk_against(&mock_server, cache_path.clone());
     let res = sdk
         .deactivate(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
-        .await
         .unwrap();
     assert!(!res.released);
     assert_eq!(res.seat_free_at, None);
@@ -486,10 +499,9 @@ async fn deactivate_refused_by_policy_is_deactivation_blocked_and_keeps_the_toke
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path.clone()).await;
+    let sdk = sdk_against(&mock_server, cache_path.clone());
     let err = sdk
         .deactivate(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
-        .await
         .unwrap_err();
     match err {
         LatteError::DeactivationBlocked {
@@ -518,17 +530,16 @@ async fn deactivate_keeps_the_token_on_statuses_that_clear_it_for_renew() {
             .mount(&mock_server)
             .await;
 
-        let sdk = sdk_against(&mock_server, cache_path.clone()).await;
+        let sdk = sdk_against(&mock_server, cache_path.clone());
         assert!(sdk
             .deactivate(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
-            .await
             .is_err());
         assert!(storage::load(&cache_path).is_some(), "status {status}");
     }
 }
 
-#[tokio::test]
-async fn deactivate_network_failure_keeps_the_token() {
+#[test]
+fn deactivate_network_failure_keeps_the_token() {
     let (_dir, cache_path) = temp_cache_path();
     storage::save(&cache_path, "not-a-real-jwt", &garbage_chain()).unwrap();
     let config = Config::with_app_id(TEST_APP_ID)
@@ -540,7 +551,6 @@ async fn deactivate_network_failure_keeps_the_token() {
 
     let err = sdk
         .deactivate(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
-        .await
         .unwrap_err();
     assert!(matches!(err, LatteError::Network(_)), "got {err:?}");
     assert!(storage::load(&cache_path).is_some());
@@ -560,11 +570,8 @@ async fn machines_parses_the_list() {
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path).await;
-    let machines = sdk
-        .machines(TEST_ACTIVATION_ID, TEST_LICENSE_KEY)
-        .await
-        .unwrap();
+    let sdk = sdk_against(&mock_server, cache_path);
+    let machines = sdk.machines(TEST_ACTIVATION_ID, TEST_LICENSE_KEY).unwrap();
     assert_eq!(machines.len(), 2);
     assert_eq!(machines[0].name.as_deref(), Some("Studio"));
     assert_eq!(machines[0].fingerprint, "9f1c4a0b2d3e");
@@ -592,10 +599,9 @@ async fn rename_machine_sends_the_name_and_returns_the_stored_one() {
         .mount(&mock_server)
         .await;
 
-    let sdk = sdk_against(&mock_server, cache_path).await;
+    let sdk = sdk_against(&mock_server, cache_path);
     let name = sdk
         .rename_machine(TEST_ACTIVATION_ID, TEST_LICENSE_KEY, " Studio Mac ")
-        .await
         .unwrap();
     assert_eq!(name, "Studio Mac");
 }
@@ -629,7 +635,7 @@ async fn activate_sends_machine_name_when_configured_and_omits_it_when_empty() {
             .with_machine_id(TEST_RAW_MACHINE_ID)
             .with_machine_name(configured);
         let sdk = Sdk::new(config).unwrap();
-        let err = sdk.activate(TEST_LICENSE_KEY).await.unwrap_err();
+        let err = sdk.activate(TEST_LICENSE_KEY).unwrap_err();
         assert!(
             matches!(err, LatteError::InvalidProjectKey),
             "name {configured:?}: got {err:?}"

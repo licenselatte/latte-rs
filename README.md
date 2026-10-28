@@ -73,7 +73,8 @@ latte-rs = "0"
 Two features are on by default and independently toggleable:
 
 - `http`: network activation/renewal, deactivation and the machine list
-  via `reqwest`.
+  via [`ureq`](https://docs.rs/ureq), a blocking HTTP client (rustls TLS).
+  No async runtime is pulled in.
 - `cache`: the on-disk token cache (`Sdk::check`, and the fast path inside
   `activate`/`renew`).
 
@@ -94,18 +95,17 @@ environment where writing a cache file isn't possible.
 ```rust
 use latte_rs::{Config, Sdk};
 
-#[tokio::main]
-async fn main() {
-    // from the LicenseLatte dashboard; other fields default to a 30s
+fn main() {
+    // from the LicenseLatte dashboard; other fields default to a 10s
     // timeout, app_id's environment base URL, and a per-project cache path
     let sdk = Sdk::new(Config::with_app_id("pk_live_..."))
         .expect("invalid app_id");
 
-    match sdk.activate("USER-PROVIDED-LICENSE-KEY").await {
+    match sdk.activate("USER-PROVIDED-LICENSE-KEY") {
         Ok(lic) => {
             println!("license OK, expires {:?}", lic.expires_at);
             if lic.in_grace_period {
-                println!("warning: offline a while, please reconnect soon");
+                println!("Couldn't reach the licence server. Connect to the internet to keep using the app.");
             }
             // Keep `lic.activation_id` around (in your own storage) so you
             // can call `sdk.renew(&lic.activation_id, &key)` later.
@@ -118,8 +118,80 @@ async fn main() {
 With the `cache` feature (on by default), a successful `activate`/`renew`
 is written to disk, and a later `activate` call for the same key returns
 the cached result without a network round trip as long as it's still
-valid. There's no background renewal thread; call `renew` yourself on
-whatever schedule fits your application.
+valid. `check` also keeps the cached token fresh in the background (see
+below); you can still call `renew` yourself on whatever schedule fits your
+application.
+
+## Blocking calls and threads
+
+`activate`, `renew`, `deactivate`, `machines` and `rename_machine` are plain
+blocking functions: each returns once the server has answered or the call
+has timed out. Call them from a worker thread, never from a GUI main
+thread, where a slow network would freeze the window. Inside an async
+executor, run them through its blocking-task API so they do not stall the
+executor's threads:
+
+```rust
+let sdk = sdk.clone(); // cheap; the clone shares the cache and renewal state
+let lic = tokio::task::spawn_blocking(move || sdk.activate(&key)).await??;
+```
+
+`check` makes no network call and takes no lock it would wait for, so it is
+safe to call from anywhere, including a GUI thread or an async task.
+
+## Timeouts
+
+| | Resolve host | Connect | Overall |
+|---|---|---|---|
+| `activate`, `renew`, `deactivate`, `machines`, `rename_machine` | 5s | 5s | 10s, or `Config::with_timeout` |
+| The background renewal `check` starts | 5s | 5s | 10s, fixed |
+
+The overall limit covers everything from resolving the host to reading the
+response, and the resolve and connect limits apply within it. Each request
+also runs on a helper thread that is abandoned one second after the
+overall limit, so a call returns `LatteError::Network` by then even when
+something no client timeout covers hangs, such as a DNS lookup that never
+returns. An abandoned helper thread holds nothing but its request, ends
+when the request does or with the process, and changes nothing.
+
+## Proxies
+
+There is no proxy setting on `Config`. The HTTP client, `ureq` 3.5, reads
+the proxy from the environment when `Sdk::new` runs: the first of
+`ALL_PROXY`, `HTTPS_PROXY` and `HTTP_PROXY` (each also in lower case) that
+holds a valid proxy URL, used for every request, and `NO_PROXY` for hosts
+to reach directly. To use a proxy, set one of them, for example
+`HTTPS_PROXY=http://user:password@proxy.example.com:8080`, before creating
+the `Sdk`. HTTP proxies (`CONNECT` for HTTPS) are supported. SOCKS proxies
+are not, because this crate does not enable `ureq`'s `socks-proxy`
+feature, and the operating system's proxy settings (macOS System Settings,
+the Windows registry) are not read. `Config::with_base_url` remains the way
+to route through a relay of your own.
+
+## Migrating from 0.5 to 0.6
+
+0.6 drops `reqwest`, `tokio` and `hyper` for the blocking `ureq` client;
+the dependency tree with all features goes from 139 crates to 59.
+
+- `activate`, `renew`, `deactivate`, `machines` and `rename_machine` are no
+  longer `async`. Drop the `.await`; names, arguments and return types
+  are unchanged, and each outcome maps to the same `LatteError` variant as
+  before. Only the wording the HTTP client puts into `Network` messages,
+  and into `Server` messages for an undecodable response, differs. From
+  async code, wrap them in `spawn_blocking` (see above).
+- The default timeout is 10s overall, down from 30s, with 5s each to
+  resolve the host and to connect. `Config::with_timeout` still sets the
+  overall limit.
+- `Sdk::new` no longer builds a client that could fail, so it never
+  returns `LatteError::Network`.
+- Proxy variables are still honoured, in a different order. 0.5 sent an
+  HTTPS request through `HTTPS_PROXY`, else `ALL_PROXY`, and ignored
+  `HTTP_PROXY` for it. 0.6 tries `ALL_PROXY`, then `HTTPS_PROXY`, then
+  `HTTP_PROXY` for every request, so `ALL_PROXY` now wins over
+  `HTTPS_PROXY`, and a machine with only `HTTP_PROXY` set now sends HTTPS
+  requests through that proxy too.
+- The crate no longer depends on `tokio`. If your code used it only
+  because this crate did, add it yourself.
 
 ## Machine ID
 
@@ -175,7 +247,7 @@ on re-activation.
 ```rust
 use latte_rs::error::LatteError;
 
-match sdk.deactivate(&activation_id, &key).await {
+match sdk.deactivate(&activation_id, &key) {
     Ok(res) => match res.seat_free_at {
         Some(at) => println!("released; the seat frees at {at:?}"),
         None => println!("released; activate the licence on your other machine"),
@@ -209,8 +281,8 @@ seat until this machine's last token has expired, which
 ## Listing and naming machines
 
 ```rust
-pub async fn machines(&self, activation_id: &str, license_key: &str) -> Result<Vec<Machine>, LatteError>
-pub async fn rename_machine(&self, activation_id: &str, license_key: &str, name: &str) -> Result<String, LatteError>
+pub fn machines(&self, activation_id: &str, license_key: &str) -> Result<Vec<Machine>, LatteError>
+pub fn rename_machine(&self, activation_id: &str, license_key: &str, name: &str) -> Result<String, LatteError>
 ```
 
 `machines` lists the machines holding a seat on the licence: `name`
@@ -261,7 +333,7 @@ fn check(token: &str, chain: &CertChain, machine_id: &str) {
         Ok(lic) => {
             println!("license OK, expires {:?}", lic.expires_at);
             if lic.in_grace_period {
-                println!("warning: offline a while, please reconnect soon");
+                println!("Couldn't reach the licence server. Connect to the internet to keep using the app.");
             }
         }
         Err(CheckError::Verify(e)) => {
@@ -313,11 +385,47 @@ In the second format `exp` is the offline deadline itself, already capped
 at the licence's end by the server. Either way `exp` is enforced by the
 validate step above, with those two reasons, and never by the JWT parse.
 
-`PublicLicense::in_grace_period` is a softer, earlier warning signal: it
-turns `true` once more than 60 minutes have passed since the last
-issuance/renewal without a fresh one arriving, while still inside the grace
-window; surface it as a "please reconnect soon" hint, distinct from an
-outright rejection.
+### `in_grace_period`
+
+`PublicLicense::in_grace_period` is true when the licence is still valid on
+cached data, the SDK has tried to renew it and could not reach the server,
+and the offline grace window has not run out. In terms of the token it is
+`renewal_failed && 60min < age < grace_period`, where `age` is the time
+since `issued_at`.
+
+`renewal_failed` is one in-memory flag per `Sdk`. A renewal attempt, the
+background one `check` starts or a manual `Sdk::renew`, sets it only when
+the attempt fails with `LatteError::Network`. Every other outcome clears
+it: a success, a rejection that wipes the cache, a 5xx or 429, a response
+that cannot be decoded, or a renewed token that fails verification. A new
+activation, a deactivation and a cache wipe clear it too. It is never
+written to the cache file and `check` never goes to the network for it, so
+it is false in a new process until a renewal attempt fails. It changes only
+on a `check` made after the attempt, so re-check once a renewal has had
+time to finish rather than rely on the value you read at startup.
+
+| Situation | `check()` | `in_grace_period` | What to tell the user |
+|---|---|---|---|
+| Token under 60 minutes old | `Ok` | `false` | Nothing. |
+| Token over 60 minutes old, no renewal has failed | `Ok` | `false` | Nothing. The SDK is renewing, or the app is online and has not renewed yet. |
+| Renewal could not reach the server, token inside the grace window | `Ok` | `true` | "Couldn't reach the licence server. Connect to the internet to keep using the app." This is the only case for that message. |
+| Renewal could not reach the server, grace window over | `Err(LatteError::NotActivated)` | n/a | "Reconnect to continue." A harder message than the one above. |
+| Renewal rejected by the server as not found, expired or for the wrong project key | `Err(LatteError::NotActivated)` after the cache is wiped | n/a | "Licence deactivated." Never "connect to the internet". |
+| Renewal answered with a 5xx or 429 | `Ok` | `false` | Nothing. The licence is kept and the next attempt is at least five minutes later. |
+
+`in_grace_period` is advisory. Gate features on the `check` verdict, never
+on `in_grace_period`: it does not change what the licence allows.
+
+Deactivating a licence in the dashboard takes effect at the next renewal
+attempt. A rejected renewal clears the local cache, so the following
+`check` returns `LatteError::NotActivated`.
+
+`check_license_at` and `check_license_any_at` take no flag and behave as if
+no renewal had failed, so `in_grace_period` is always `false` on what they
+return. If you keep that state yourself, pass it to
+`check_license_at_with_renewal_failed` or
+`check_license_any_at_with_renewal_failed`. `validate::in_grace_period`
+takes it as its third argument.
 
 ## License-key format utilities
 
@@ -326,6 +434,47 @@ normalization and checksum validation as every other LicenseLatte SDK
 (uppercase, strip separators, fold `O/I/L` to `0/1/1`, verify a 2- or
 4-character trailing checksum). This is a typo-catcher for end users pasting
 keys, not a security boundary.
+
+## Background renewal
+
+`check` answers from the cached token alone and returns immediately. When
+that token is at least 60 minutes old, `check` also starts a renewal on a
+detached background thread, so the cached token stays fresh while the app
+is online. It starts one only if none is running and the last attempt,
+background or a manual `renew`, began at least five minutes ago, so a host
+that calls `check` often still sends at most one request per five minutes.
+Nothing in `check` waits for it, and the thread never keeps your process
+from exiting. If another thread is updating the renewal state at the
+moment `check` looks, `check` starts nothing rather than wait, and a later
+`check` tries again; its verdict is the same either way. A renewal still
+running after ten minutes is taken to be stuck: the next `check` starts a
+new one, and whatever the stuck one returns later is dropped.
+
+- A renewal that succeeds replaces the cached token and clears
+  `in_grace_period`.
+- A renewal the server rejects as not found, expired or for the wrong
+  project key clears the cache, so the next `check` returns
+  `LatteError::NotActivated`. Deactivating a licence in the dashboard
+  therefore takes effect at the next renewal attempt, not instantly.
+- Every other failure (no network, a timeout, a 5xx or 429, a response that
+  does not verify) is dropped. The cached token stays valid until its
+  grace period ends, and a later `check` tries again. A failure to reach
+  the server (no network, a timeout) also sets `in_grace_period`; see
+  [`in_grace_period`](#in_grace_period) above.
+
+The renewal also starts for a cached token whose grace window has already
+ended, as long as its signature chain verifies and it was issued to this
+machine. A computer that was off longer than the grace window therefore
+recovers by itself: the first `check` after launch returns
+`LatteError::NotActivated` (or `LatteError::LicenseExpired`), the SDK
+renews in the background, and a `check` a few seconds later, while online,
+returns the licence. Hosts should re-check rather than send the user to
+activate again. A token that fails verification or belongs to another
+machine starts no request.
+
+The thread makes the same blocking request as `renew`, with fixed limits
+of 5s to connect and 10s overall (see [Timeouts](#timeouts)), so no async
+runtime is involved.
 
 ## The cache file
 
@@ -427,9 +576,9 @@ it server-side.
 
 ## What this crate does *not* do
 
-Background renewal scheduling is intentionally out of scope. There's no
-scheduler here; `Sdk::renew` is the building block; call it on a timer, in
-response to a UI action, or whatever fits your application.
+There's no scheduler beyond the background renewal `check` starts.
+`Sdk::renew` is the building block for anything more: call it on a timer,
+in response to a UI action, or whatever fits your application.
 
 ## Testing
 

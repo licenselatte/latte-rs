@@ -9,7 +9,7 @@ use latte_rs::error::ValidateError;
 use latte_rs::storage;
 use latte_rs::validate::{in_grace_period, validate_at};
 use latte_rs::verify::{verify_activation_any_at, verify_activation_at};
-use latte_rs::{check_license_at, PublicLicense, UNLIMITED};
+use latte_rs::{check_license_at, check_license_at_with_renewal_failed, PublicLicense, UNLIMITED};
 use serde::Deserialize;
 use std::fs;
 use std::time::{Duration, SystemTime};
@@ -33,6 +33,8 @@ struct Fixture {
     expect_stage: String,
     expect_reason: String,
     expect_in_grace_period: bool,
+    #[serde(default)]
+    renewal_failed: bool,
     expect_has_entitlements: bool,
     expect_entitlements: serde_json::Map<String, serde_json::Value>,
 }
@@ -169,7 +171,7 @@ fn run_one(f: &Fixture) -> Result<(), String> {
         ));
     }
 
-    let in_grace = in_grace_period(&license, now);
+    let in_grace = in_grace_period(&license, now, f.renewal_failed);
     if in_grace != f.expect_in_grace_period {
         return Err(format!(
             "in_grace_period mismatch: got {in_grace}, want {}",
@@ -177,12 +179,33 @@ fn run_one(f: &Fixture) -> Result<(), String> {
         ));
     }
 
-    // Through the public check_license_at rather than the decoder, so this
+    // Through the public check functions rather than the decoder, so this
     // covers the wiring an application actually gets back, not just the
     // parsing. It re-runs verify+validate, which for an accepted fixture is
     // cheap and cannot fail.
-    let public = check_license_at(&master_pub, &f.token, &chain, &f.machine_id, now)
+    let public = check_license_at_with_renewal_failed(
+        &master_pub,
+        &f.token,
+        &chain,
+        &f.machine_id,
+        now,
+        f.renewal_failed,
+    )
+    .map_err(|e| {
+        format!("check_license_at_with_renewal_failed failed on an accepted fixture: {e}")
+    })?;
+    if public.in_grace_period != f.expect_in_grace_period {
+        return Err(format!(
+            "PublicLicense::in_grace_period mismatch: got {}, want {}",
+            public.in_grace_period, f.expect_in_grace_period
+        ));
+    }
+    // check_license_at is the same call with no failed renewal.
+    let plain = check_license_at(&master_pub, &f.token, &chain, &f.machine_id, now)
         .map_err(|e| format!("check_license_at failed on an accepted fixture: {e}"))?;
+    if plain.in_grace_period {
+        return Err("check_license_at reported in_grace_period without a failed renewal".into());
+    }
     assert_entitlements(&public, f)?;
 
     Ok(())

@@ -28,6 +28,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::appid::parse_app_id;
 use crate::domain::CertChain;
+#[cfg(feature = "cache")]
+use crate::domain::License;
 use crate::error::LatteError;
 use crate::key::{normalize_key, sanitize_key};
 use crate::machine_id;
@@ -38,7 +40,7 @@ use crate::verify::verify_activation_any_at;
 use crate::verify::{master_public_keys, unix_to_system_time};
 use crate::{check_license_any_at, PublicLicense};
 #[cfg(feature = "cache")]
-use crate::{error::ValidateError, storage, CheckError};
+use crate::{error::ValidateError, storage};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -430,6 +432,13 @@ impl Sdk {
     /// succeeds replaces the cached token under the same condition. Every
     /// other failure is dropped: the cached token stays usable until its
     /// grace window ends, and a later `check` tries again.
+    ///
+    /// The renewal also starts for a token past its grace window or its
+    /// licence end, provided its signature chain verifies and it was issued
+    /// to this machine. That `check` still returns the error, but once the
+    /// renewal has saved a new token a re-check a few seconds later returns
+    /// the licence, so a host should re-check rather than send the user to
+    /// activate again.
     #[cfg(feature = "cache")]
     pub fn check(&self) -> Result<PublicLicense, LatteError> {
         let Some(path) = &self.cache_path else {
@@ -439,20 +448,25 @@ impl Sdk {
             return Err(LatteError::NotActivated);
         };
 
-        match check_license_any_at(
-            &self.master_pubs,
-            &token,
-            &chain,
-            &self.machine_id,
-            (self.clock)(),
-        ) {
-            Ok(lic) => {
-                self.renew_in_background(&lic);
-                Ok(lic)
+        let now = (self.clock)();
+        let Ok(license) = verify_activation_any_at(&self.master_pubs, &token, &chain, now) else {
+            return Err(LatteError::NotActivated);
+        };
+        let verdict = validate_at(&license, &self.machine_id, now);
+        // A token that verifies but has outlived its grace window or its
+        // licence end still names an activation the server can renew.
+        if license.machine_id == self.machine_id
+            && !license.activation_id.is_empty()
+            && !license.key.is_empty()
+        {
+            self.renew_in_background(&license);
+        }
+        match verdict {
+            Ok(()) => {
+                let in_grace = in_grace_period(&license, now);
+                Ok(crate::to_public_license(license, in_grace))
             }
-            Err(CheckError::Validate(ValidateError::HardExpired)) => {
-                Err(LatteError::LicenseExpired)
-            }
+            Err(ValidateError::HardExpired) => Err(LatteError::LicenseExpired),
             Err(_) => Err(LatteError::NotActivated),
         }
     }
@@ -493,7 +507,7 @@ impl Sdk {
     /// least [`RENEW_AFTER`] old, none is running, and the last attempt
     /// began at least [`RENEW_RETRY`] ago. Never blocks.
     #[cfg(feature = "cache")]
-    fn renew_in_background(&self, lic: &PublicLicense) {
+    fn renew_in_background(&self, lic: &License) {
         let now = (self.clock)();
         let age = now.duration_since(lic.issued_at).unwrap_or(Duration::ZERO);
         {

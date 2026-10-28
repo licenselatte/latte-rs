@@ -348,6 +348,16 @@ from exiting.
   does not verify) is dropped. The cached token stays valid until its
   grace period ends, and a later `check` tries again.
 
+The renewal also starts for a cached token whose grace window has already
+ended, as long as its signature chain verifies and it was issued to this
+machine. A computer that was off longer than the grace window therefore
+recovers by itself: the first `check` after launch returns
+`LatteError::NotActivated` (or `LatteError::LicenseExpired`), the SDK
+renews in the background, and a `check` a few seconds later, while online,
+returns the licence. Hosts should re-check rather than send the user to
+activate again. A token that fails verification or belongs to another
+machine starts no request.
+
 The thread builds its own small `tokio` runtime, so `check` stays a
 plain synchronous call that works with or without an async runtime of
 your own. The crate depends on `tokio`'s `rt`, `net` and `time` features

@@ -75,6 +75,11 @@ pub struct PublicLicense {
     /// never ends.
     pub expires_at: SystemTime,
     pub grace_period: std::time::Duration,
+    /// True when the licence is still valid on cached data, the SDK has
+    /// tried to renew it and could not reach the server, and the offline
+    /// grace window has not run out.
+    ///
+    /// Advisory: gate features on the `check` verdict, never on this.
     pub in_grace_period: bool,
     pub license_type: domain::LicenseType,
     pub metadata: HashMap<String, String>,
@@ -135,10 +140,13 @@ impl PublicLicense {
 }
 
 /// Runs the full pipeline on a cached or freshly-received token: chain
-/// verification, then grace-period validation, then the `InGracePeriod`
+/// verification, then grace-period validation, then the `in_grace_period`
 /// computation. This is the primary entry point plugin developers embed;
 /// see the module-level docs for what it does and why, and `README.md` for
 /// usage.
+///
+/// It assumes no renewal has failed, so `in_grace_period` is always false.
+/// Use [`check_license_at_with_renewal_failed`] to pass that in.
 pub fn check_license_at(
     master_pub: &ed25519_dalek::VerifyingKey,
     token: &str,
@@ -146,12 +154,28 @@ pub fn check_license_at(
     machine_id: &str,
     now: SystemTime,
 ) -> Result<PublicLicense, CheckError> {
-    check_license_any_at(
+    check_license_at_with_renewal_failed(master_pub, token, chain, machine_id, now, false)
+}
+
+/// [`check_license_at`] for a caller that knows whether its last attempt to
+/// renew the licence failed to reach the server. `renewal_failed` is the
+/// input of [`PublicLicense::in_grace_period`], which is false whenever it
+/// is false.
+pub fn check_license_at_with_renewal_failed(
+    master_pub: &ed25519_dalek::VerifyingKey,
+    token: &str,
+    chain: &CertChain,
+    machine_id: &str,
+    now: SystemTime,
+    renewal_failed: bool,
+) -> Result<PublicLicense, CheckError> {
+    check_license_any_at_with_renewal_failed(
         std::slice::from_ref(master_pub),
         token,
         chain,
         machine_id,
         now,
+        renewal_failed,
     )
 }
 
@@ -164,11 +188,24 @@ pub fn check_license_any_at(
     machine_id: &str,
     now: SystemTime,
 ) -> Result<PublicLicense, CheckError> {
+    check_license_any_at_with_renewal_failed(master_pubs, token, chain, machine_id, now, false)
+}
+
+/// [`check_license_any_at`] with the `renewal_failed` input of
+/// [`check_license_at_with_renewal_failed`].
+pub fn check_license_any_at_with_renewal_failed(
+    master_pubs: &[ed25519_dalek::VerifyingKey],
+    token: &str,
+    chain: &CertChain,
+    machine_id: &str,
+    now: SystemTime,
+    renewal_failed: bool,
+) -> Result<PublicLicense, CheckError> {
     let license: License = verify::verify_activation_any_at(master_pubs, token, chain, now)
         .map_err(CheckError::Verify)?;
     validate::validate_at(&license, machine_id, now).map_err(CheckError::Validate)?;
 
-    let in_grace = validate::in_grace_period(&license, now);
+    let in_grace = validate::in_grace_period(&license, now, renewal_failed);
 
     Ok(to_public_license(license, in_grace))
 }

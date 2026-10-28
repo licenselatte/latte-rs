@@ -105,7 +105,7 @@ async fn main() {
         Ok(lic) => {
             println!("license OK, expires {:?}", lic.expires_at);
             if lic.in_grace_period {
-                println!("warning: offline a while, please reconnect soon");
+                println!("Couldn't reach the licence server. Connect to the internet to keep using the app.");
             }
             // Keep `lic.activation_id` around (in your own storage) so you
             // can call `sdk.renew(&lic.activation_id, &key)` later.
@@ -262,7 +262,7 @@ fn check(token: &str, chain: &CertChain, machine_id: &str) {
         Ok(lic) => {
             println!("license OK, expires {:?}", lic.expires_at);
             if lic.in_grace_period {
-                println!("warning: offline a while, please reconnect soon");
+                println!("Couldn't reach the licence server. Connect to the internet to keep using the app.");
             }
         }
         Err(CheckError::Verify(e)) => {
@@ -314,11 +314,47 @@ In the second format `exp` is the offline deadline itself, already capped
 at the licence's end by the server. Either way `exp` is enforced by the
 validate step above, with those two reasons, and never by the JWT parse.
 
-`PublicLicense::in_grace_period` is a softer, earlier warning signal: it
-turns `true` once more than 60 minutes have passed since the last
-issuance/renewal without a fresh one arriving, while still inside the grace
-window; surface it as a "please reconnect soon" hint, distinct from an
-outright rejection.
+### `in_grace_period`
+
+`PublicLicense::in_grace_period` is true when the licence is still valid on
+cached data, the SDK has tried to renew it and could not reach the server,
+and the offline grace window has not run out. In terms of the token it is
+`renewal_failed && 60min < age < grace_period`, where `age` is the time
+since `issued_at`.
+
+`renewal_failed` is one in-memory flag per `Sdk`. A renewal attempt, the
+background one `check` starts or a manual `Sdk::renew`, sets it only when
+the attempt fails with `LatteError::Network`. Every other outcome clears
+it: a success, a rejection that wipes the cache, a 5xx or 429, a response
+that cannot be decoded, or a renewed token that fails verification. A new
+activation, a deactivation and a cache wipe clear it too. It is never
+written to the cache file and `check` never goes to the network for it, so
+it is false in a new process until a renewal attempt fails. It changes only
+on a `check` made after the attempt, so re-check once a renewal has had
+time to finish rather than rely on the value you read at startup.
+
+| Situation | `check()` | `in_grace_period` | What to tell the user |
+|---|---|---|---|
+| Token under 60 minutes old | `Ok` | `false` | Nothing. |
+| Token over 60 minutes old, no renewal has failed | `Ok` | `false` | Nothing. The SDK is renewing, or the app is online and has not renewed yet. |
+| Renewal could not reach the server, token inside the grace window | `Ok` | `true` | "Couldn't reach the licence server. Connect to the internet to keep using the app." This is the only case for that message. |
+| Renewal could not reach the server, grace window over | `Err(LatteError::NotActivated)` | n/a | "Reconnect to continue." A harder message than the one above. |
+| Renewal rejected by the server as not found, expired or for the wrong project key | `Err(LatteError::NotActivated)` after the cache is wiped | n/a | "Licence deactivated." Never "connect to the internet". |
+| Renewal answered with a 5xx or 429 | `Ok` | `false` | Nothing. The licence is kept and the next attempt is at least five minutes later. |
+
+`in_grace_period` is advisory. Gate features on the `check` verdict, never
+on `in_grace_period`: it does not change what the licence allows.
+
+Deactivating a licence in the dashboard takes effect at the next renewal
+attempt. A rejected renewal clears the local cache, so the following
+`check` returns `LatteError::NotActivated`.
+
+`check_license_at` and `check_license_any_at` take no flag and behave as if
+no renewal had failed, so `in_grace_period` is always `false` on what they
+return. If you keep that state yourself, pass it to
+`check_license_at_with_renewal_failed` or
+`check_license_any_at_with_renewal_failed`. `validate::in_grace_period`
+takes it as its third argument.
 
 ## License-key format utilities
 
@@ -339,14 +375,17 @@ that calls `check` often still sends at most one request per five minutes.
 Nothing in `check` waits for it, and the thread never keeps your process
 from exiting.
 
-- A renewal that succeeds replaces the cached token.
+- A renewal that succeeds replaces the cached token and clears
+  `in_grace_period`.
 - A renewal the server rejects as not found, expired or for the wrong
   project key clears the cache, so the next `check` returns
   `LatteError::NotActivated`. Deactivating a licence in the dashboard
   therefore takes effect at the next renewal attempt, not instantly.
 - Every other failure (no network, a timeout, a 5xx or 429, a response that
   does not verify) is dropped. The cached token stays valid until its
-  grace period ends, and a later `check` tries again.
+  grace period ends, and a later `check` tries again. A failure to reach
+  the server (no network, a timeout) also sets `in_grace_period`; see
+  [`in_grace_period`](#in_grace_period) above.
 
 The renewal also starts for a cached token whose grace window has already
 ended, as long as its signature chain verifies and it was issued to this

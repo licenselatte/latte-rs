@@ -36,7 +36,7 @@ use crate::validate::{in_grace_period, validate_at};
 #[cfg(feature = "cache")]
 use crate::verify::verify_activation_any_at;
 use crate::verify::{master_public_keys, unix_to_system_time};
-use crate::{check_license_any_at, PublicLicense};
+use crate::{check_license_any_at_with_renewal_failed, PublicLicense};
 #[cfg(feature = "cache")]
 use crate::{error::ValidateError, storage, CheckError};
 
@@ -202,6 +202,11 @@ struct Renewal {
     in_flight: bool,
     /// When the last renewal attempt, background or manual, started.
     last_attempt: Option<SystemTime>,
+    /// Whether the last renewal attempt could not reach the server and
+    /// nothing has succeeded or been rejected since. Never persisted:
+    /// `check` reads it from here, so a fresh process starts false. It is
+    /// the input of [`PublicLicense::in_grace_period`].
+    renewal_failed: bool,
 }
 
 /// Marks the background renewal finished when dropped, even on a panic, so
@@ -330,7 +335,9 @@ impl Sdk {
     ///
     /// With the `cache` feature, a call counts as a renewal attempt for the
     /// background renewal in [`Sdk::check`], which waits five minutes after
-    /// it before trying again.
+    /// it before trying again. It also feeds
+    /// [`PublicLicense::in_grace_period`] the same way: a call that fails
+    /// with `LatteError::Network` sets it, and any other outcome clears it.
     pub async fn renew(
         &self,
         activation_id: &str,
@@ -341,9 +348,10 @@ impl Sdk {
             self.renewal().last_attempt = Some((self.clock)());
         }
         let body = self.credentials(activation_id, license_key, None);
-        let (token, chain) = self
-            .post_and_handle_invalidation("/v1/renew", &body)
-            .await?;
+        let renewed = self.post_and_handle_invalidation("/v1/renew", &body).await;
+        #[cfg(feature = "cache")]
+        self.note_renewal(activation_id, &renewed);
+        let (token, chain) = renewed?;
         let lic = self.verify_and_validate(&token, &chain, &self.machine_id)?;
         #[cfg(feature = "cache")]
         self.save_to_cache(&token, &chain);
@@ -430,6 +438,12 @@ impl Sdk {
     /// succeeds replaces the cached token under the same condition. Every
     /// other failure is dropped: the cached token stays usable until its
     /// grace window ends, and a later `check` tries again.
+    ///
+    /// `in_grace_period` on the result is true when the licence is still
+    /// valid on cached data, the SDK has tried to renew it and could not
+    /// reach the server, and the offline grace window has not run out. It
+    /// comes from memory, not from the cache file, so it is false in a new
+    /// process and changes only on a `check` made after the attempt.
     #[cfg(feature = "cache")]
     pub fn check(&self) -> Result<PublicLicense, LatteError> {
         let Some(path) = &self.cache_path else {
@@ -439,12 +453,14 @@ impl Sdk {
             return Err(LatteError::NotActivated);
         };
 
-        match check_license_any_at(
+        let renewal_failed = self.renewal().renewal_failed;
+        match check_license_any_at_with_renewal_failed(
             &self.master_pubs,
             &token,
             &chain,
             &self.machine_id,
             (self.clock)(),
+            renewal_failed,
         ) {
             Ok(lic) => {
                 self.renew_in_background(&lic);
@@ -479,7 +495,7 @@ impl Sdk {
         let now = (self.clock)();
         let license = verify_activation_any_at(&self.master_pubs, &token, &chain, now).ok()?;
         validate_at(&license, machine_id, now).ok()?;
-        let in_grace = in_grace_period(&license, now);
+        let in_grace = in_grace_period(&license, now, self.renewal().renewal_failed);
         let alias = license.alias.clone();
         Some((crate::to_public_license(license, in_grace), alias))
     }
@@ -531,7 +547,9 @@ impl Sdk {
             return;
         };
         let body = self.credentials(activation_id, license_key, None);
-        match runtime.block_on(self.post("/v1/renew", &body)) {
+        let renewed = runtime.block_on(self.post("/v1/renew", &body));
+        self.note_renewal(activation_id, &renewed);
+        match renewed {
             Ok((token, chain)) => {
                 if self
                     .verify_and_validate(&token, &chain, &self.machine_id)
@@ -560,6 +578,18 @@ impl Sdk {
         }
     }
 
+    /// Records how a renewal of `activation_id` ended. Only a failure to
+    /// reach the server sets the flag, and only while the cache still holds
+    /// that activation; every other outcome, including a server error,
+    /// clears it, because the server answered or the failure is not about
+    /// connectivity.
+    #[cfg(feature = "cache")]
+    fn note_renewal<T>(&self, activation_id: &str, outcome: &Result<T, LatteError>) {
+        let mut state = self.renewal();
+        state.renewal_failed =
+            matches!(outcome, Err(LatteError::Network(_))) && self.holds_activation(activation_id);
+    }
+
     /// Whether the cache holds a verifiable token for `activation_id`.
     /// Callers hold the [`Sdk::renewal`] lock across this and the write it
     /// guards, so a deactivation or re-activation cannot slip in between.
@@ -574,7 +604,8 @@ impl Sdk {
 
     #[cfg(feature = "cache")]
     fn save_to_cache(&self, token: &str, chain: &CertChain) {
-        let _cache = self.renewal();
+        let mut state = self.renewal();
+        state.renewal_failed = false;
         if let Some(path) = &self.cache_path {
             // Best-effort: a local write failure shouldn't turn a
             // successful network activation into an error.
@@ -584,7 +615,8 @@ impl Sdk {
 
     #[cfg(feature = "cache")]
     fn clear_cache(&self) {
-        let _cache = self.renewal();
+        let mut state = self.renewal();
+        state.renewal_failed = false;
         if let Some(path) = &self.cache_path {
             let _ = storage::clear(path);
         }
@@ -596,8 +628,15 @@ impl Sdk {
         chain: &CertChain,
         machine_id: &str,
     ) -> Result<PublicLicense, LatteError> {
-        check_license_any_at(&self.master_pubs, token, chain, machine_id, (self.clock)())
-            .map_err(|e| LatteError::Server(format!("server returned invalid token: {e}")))
+        check_license_any_at_with_renewal_failed(
+            &self.master_pubs,
+            token,
+            chain,
+            machine_id,
+            (self.clock)(),
+            false,
+        )
+        .map_err(|e| LatteError::Server(format!("server returned invalid token: {e}")))
     }
 
     /// Calls `post`, and on a response that unambiguously means "this
